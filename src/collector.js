@@ -1,23 +1,24 @@
-// One collection cycle: fetch a snapshot and fold it into the database.
-// Runnable standalone (`npm run collect`) for cron-style deployments, and
-// imported by the server for the built-in scheduler.
+// One collection cycle: fetch a snapshot, fold it into the persisted state, and
+// write the refreshed dashboard outputs. Storage-agnostic — works with the local
+// file store or the S3 store. Reused by the dev server and the AWS Lambda.
 
 import { fetchSnapshot } from './kubra.js';
-import { openDb, ingestSnapshot } from './db.js';
+import { applySnapshot, buildOutputs } from './engine.js';
+import { makeStore } from './store.js';
+import { publicConfig } from './config.js';
 
-export async function collectOnce(db) {
-  const ownDb = !db;
-  const database = db || openDb();
-  try {
-    const snap = await fetchSnapshot();
-    const result = ingestSnapshot(database, snap);
-    return { snap, result };
-  } finally {
-    if (ownDb) database.close();
-  }
+export async function collectOnce(store = makeStore()) {
+  const state = await store.load();
+  const snap = await fetchSnapshot();
+  const result = applySnapshot(state, snap);
+  await store.save(state);
+  const outputs = buildOutputs(state);
+  outputs.config = { ...publicConfig(), generatedAt: snap.fetchedAt };
+  await store.writeOutputs(outputs);
+  return { snap, result, state, outputs };
 }
 
-// CLI entry point.
+// CLI entry point: `npm run collect`
 if (import.meta.url === `file://${process.argv[1]}`) {
   collectOnce()
     .then(({ snap, result }) => {

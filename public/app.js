@@ -11,6 +11,20 @@ async function getJSON(url) {
   return r.json();
 }
 
+// Dashboard data is published as static JSON (by the local server or, in
+// production, by the S3-writing Lambda). Cache-bust so refreshes see new polls.
+const data = (name) => getJSON(`data/${name}.json?t=${Date.now()}`);
+
+// Recompute the window-dependent hit/late/early rates in the browser, so the
+// on-time-window selector needs no server round-trip (and works on static S3).
+function computeRates(errors, win) {
+  const n = errors.length;
+  if (!n) return { onTimeRate: null, lateRate: null, earlyRate: null };
+  const late = errors.filter((e) => e > win).length;
+  const early = errors.filter((e) => e < -win).length;
+  return { onTimeRate: (n - late - early) / n, lateRate: late / n, earlyRate: early / n };
+}
+
 // ---------- formatting ----------
 const nf = new Intl.NumberFormat('en-US');
 const fmtInt = (n) => (n == null ? '—' : nf.format(Math.round(n)));
@@ -406,13 +420,17 @@ function renderCurrent(rows) {
 
 // ---------- orchestration ----------
 async function refresh() {
-  const win = $('#window').value;
+  const win = Number($('#window').value);
   const [status, acc, current, ts] = await Promise.all([
-    getJSON('/api/status'),
-    getJSON(`/api/accuracy?window=${win}`),
-    getJSON('/api/current'),
-    getJSON('/api/timeseries'),
+    data('status'),
+    data('accuracy'),
+    data('current'),
+    data('timeseries'),
   ]);
+
+  // Apply the selected on-time window client-side.
+  acc.onTimeWindowMin = win;
+  Object.assign(acc, computeRates(acc.errors || [], win));
 
   const l = status.latest || {};
   $('#updated').textContent = l.fetchedAt
@@ -430,7 +448,7 @@ async function refresh() {
 
 async function init() {
   try {
-    cfg = await getJSON('/api/config');
+    cfg = await data('config');
     $('#utility').textContent = `${cfg.utilityName} — ETR Accuracy`;
     document.title = `${cfg.utilityName} — ETR Accuracy`;
     const src = $('#source');
@@ -439,18 +457,22 @@ async function init() {
   } catch {}
 
   $('#window').addEventListener('change', () => refresh().catch(console.error));
+  // "Collect now" works against the local dev server. On the static S3 deploy
+  // there is no collect endpoint (a Lambda polls on a schedule), so the button
+  // gracefully retires itself.
   $('#collect').addEventListener('click', async () => {
     const b = $('#collect');
     b.disabled = true;
     b.textContent = 'Collecting…';
     try {
-      await fetch('/api/collect', { method: 'POST' });
+      const r = await fetch('/api/collect', { method: 'POST' });
+      if (!r.ok) throw new Error(`collect -> ${r.status}`);
       await refresh();
-    } catch (e) {
-      console.error(e);
-    } finally {
       b.disabled = false;
       b.textContent = 'Collect now';
+    } catch (e) {
+      b.textContent = `auto every ${cfg.pollMinutes || 15} min`;
+      b.title = 'Collection runs automatically; manual collect is dev-only.';
     }
   });
 

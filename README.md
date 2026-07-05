@@ -79,12 +79,48 @@ Accuracy needs resolved outages, which takes time to accumulate. To preview the
 full dashboard immediately with a **fabricated** storm:
 
 ```bash
-node src/seed-demo.js
-DB_PATH=data/demo.db npm start
+npm run demo
+NO_SCHEDULER=1 npm start     # NO_SCHEDULER keeps the demo data (no live poll)
 ```
 
 > The demo numbers are invented to exercise the UI — they are **not** real
-> utility performance. Delete `data/demo.db` and collect live data for that.
+> utility performance. Delete `data/state.json` and run live to collect real data.
+
+## Deploy to AWS (serverless, S3-hosted)
+
+The natural home for this is fully serverless on AWS — no server to keep alive,
+pennies per month:
+
+```
+EventBridge (every 15 min) → Lambda collector → S3
+                                                 ├─ (private) state/state.json   running state
+                                                 └─ (public)  data/*.json        dashboard feed
+S3 static site  ─ CloudFront (HTTPS) ─→  the dashboard, which just reads data/*.json
+```
+
+There is no API server and no database: the Lambda folds each poll into a JSON
+state object in a **private** bucket and republishes the precomputed dashboard
+JSON to a **public** site bucket that CloudFront serves over HTTPS. The browser
+reads those static files directly.
+
+**Prerequisites:** the [AWS CLI](https://docs.aws.amazon.com/cli/) and
+[AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html),
+with credentials configured for your account (`aws configure`).
+
+```bash
+./infra/deploy.sh          # STACK=my-name AWS_REGION=us-east-1 to customize
+```
+
+That single command creates the buckets, Lambda, 15-minute schedule, and
+CloudFront distribution; uploads the dashboard; seeds the first data point; and
+prints the HTTPS URL. Everything is defined in `infra/template.yaml` (AWS SAM);
+the Lambda is a pure-JS zip (no native modules, no `node_modules` — global
+`fetch` and the runtime-provided AWS SDK are all it needs). Tear down with
+`sam delete --stack-name <name>` (empty the buckets first).
+
+Other hosting options (Railway/Render/Fly for the always-on server, or Vercel +
+a hosted DB + external cron) also work, but the AWS/S3 path above is the
+recommended one.
 
 ## Configuration
 
@@ -92,9 +128,11 @@ All via environment variables (see `src/config.js`):
 
 | Var | Default | Purpose |
 | --- | --- | --- |
-| `PORT` | `3000` | Dashboard port |
+| `PORT` | `3000` | Dashboard port (local server) |
 | `POLL_MINUTES` | `15` | Poll interval (also the resolution-timing uncertainty) |
-| `DB_PATH` | `data/outages.db` | SQLite file |
+| `STATE_PATH` | `data/state.json` | Local state file |
+| `S3_BUCKET` | — | If set, use S3 for the data feed instead of local files (enables the AWS path) |
+| `S3_STATE_BUCKET` | = `S3_BUCKET` | Private bucket for running state |
 | `NO_SCHEDULER` | — | Set to `1` to disable the built-in poller |
 | `KUBRA_INSTANCE_ID` / `KUBRA_VIEW_ID` | JCP&L's | Point at another FirstEnergy operating company |
 | `UTILITY_NAME` / `SOURCE_URL` | JCP&L | UI labels |
@@ -103,16 +141,21 @@ Because the utility identifiers are just config, the same app can track
 Met-Ed, Penelec, West Penn, Ohio Edison, etc. — grab their `instanceId` /
 `viewId` from that map's page source (`var BOOTSTRAP_CONFIG`).
 
-## API
+## Data feed
 
-| Endpoint | Returns |
+The dashboard reads these static JSON documents (published locally under
+`public/data/`, in production to `s3://<site-bucket>/data/`):
+
+| File | Contents |
 | --- | --- |
-| `GET /api/status` | Collection status + latest snapshot totals |
-| `GET /api/current` | Currently-open outages |
-| `GET /api/accuracy?window=60` | Aggregate accuracy (± window in minutes) |
-| `GET /api/episodes` | Graded (resolved, ETR-bearing) episodes |
-| `GET /api/timeseries` | Customers-out over the collection window |
-| `POST /api/collect` | Trigger one poll now |
+| `config.json` | Utility labels + poll interval |
+| `status.json` | Collection status + latest snapshot totals |
+| `current.json` | Currently-open outages |
+| `accuracy.json` | Aggregate accuracy + a raw `errors` array (the on-time window is applied in the browser) |
+| `timeseries.json` | Customers-out over the collection window |
+
+The local dev server additionally exposes `POST /api/collect` to trigger a poll
+on demand.
 
 ## Methodology notes & caveats
 
@@ -140,11 +183,16 @@ npm test           # verifies the episode lifecycle + accuracy math
 src/
   config.js      utility IDs + tunables (env-overridable)
   kubra.js       KUBRA StormCenter feed client
-  db.js          SQLite schema + episode lifecycle (the core model)
-  analytics.js   accuracy math + dashboard queries
-  collector.js   one poll → DB (CLI + importable)
-  server.js      dashboard + JSON API + built-in scheduler
+  engine.js      pure episode model + accuracy math (storage-agnostic core)
+  store.js       persistence: local files (dev) or S3 (prod)
+  collector.js   one poll → state + published JSON (CLI + importable)
+  server.js      local dev server: static dashboard + built-in scheduler
+  lambda.js      AWS Lambda handler for the scheduled collector
   seed-demo.js   synthetic storm for previewing the UI
 public/          dashboard (vanilla JS + hand-rolled SVG charts, no CDN)
+infra/           AWS SAM template + deploy scripts (S3 + Lambda + CloudFront)
 test/            accuracy + episode tests
 ```
+
+The core (`engine.js`) is a pure function library over plain state, so the same
+tested logic runs behind the local file store and the S3-backed Lambda.

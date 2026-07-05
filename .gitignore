@@ -1,7 +1,8 @@
 node_modules/
+data/state.json
 data/*.db
-data/*.db-journal
-data/*.db-wal
-data/*.db-shm
+data/*.db-*
+public/data/
 *.log
 .DS_Store
+infra/build/

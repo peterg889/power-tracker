@@ -30,9 +30,6 @@ export const config = {
   // HTTP port for the dashboard/server.
   port: Number(process.env.PORT || 3000),
 
-  // SQLite database location.
-  dbPath: process.env.DB_PATH || new URL('../data/outages.db', import.meta.url).pathname,
-
   // An outage "episode" for an area ends when the area drops out of the feed
   // (or falls to 0 customers affected). Because we only see the feed at poll
   // time, actual restoration happened somewhere between the last poll it was
@@ -42,3 +39,13 @@ export const config = {
     return this.pollMinutes;
   },
 };
+
+// The subset of config exposed to the browser dashboard.
+export function publicConfig() {
+  return {
+    utilityName: config.utilityName,
+    sourceUrl: config.sourceUrl,
+    pollMinutes: config.pollMinutes,
+    resolutionUncertaintyMinutes: config.resolutionUncertaintyMinutes,
+  };
+}

@@ -1,0 +1,142 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  JCP&L / FirstEnergy ETR accuracy tracker. A scheduled Lambda polls the public
+  outage feed and writes running state + precomputed dashboard JSON to S3; a
+  private state bucket holds the working data, and a public site bucket (served
+  over HTTPS via CloudFront) hosts the static dashboard. No servers, no database.
+
+Parameters:
+  PollMinutes:
+    Type: Number
+    Default: 15
+    Description: How often (minutes) the collector polls the outage feed.
+  UtilityName:
+    Type: String
+    Default: "JCP&L (FirstEnergy New Jersey)"
+  SourceUrl:
+    Type: String
+    Default: "https://outages-nj.firstenergycorp.com/"
+  KubraInstanceId:
+    Type: String
+    Default: 6c715f0e-bbec-465f-98cc-0b81623744be
+  KubraViewId:
+    Type: String
+    Default: fcd7c23d-de37-4471-8ca3-37c3260f94fa
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Timeout: 60
+    MemorySize: 256
+
+Resources:
+  # Public bucket: static dashboard assets + the precomputed data/*.json feed.
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # Private bucket: the collector's running state (never exposed to browsers).
+  StateBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  Collector:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: build/lambda/
+      Handler: src/lambda.handler
+      Description: Polls the outage feed and republishes the dashboard JSON to S3.
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref SiteBucket
+          S3_STATE_BUCKET: !Ref StateBucket
+          POLL_MINUTES: !Ref PollMinutes
+          UTILITY_NAME: !Ref UtilityName
+          SOURCE_URL: !Ref SourceUrl
+          KUBRA_INSTANCE_ID: !Ref KubraInstanceId
+          KUBRA_VIEW_ID: !Ref KubraViewId
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref SiteBucket
+        - S3CrudPolicy:
+            BucketName: !Ref StateBucket
+      Events:
+        Poll:
+          Type: Schedule
+          Properties:
+            Schedule: !Sub 'rate(${PollMinutes} minutes)'
+            Name: !Sub '${AWS::StackName}-poll'
+            Description: Scheduled outage-feed poll.
+
+  SiteOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub '${AWS::StackName} outage ETR dashboard'
+        DefaultRootObject: index.html
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: site-s3
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !Ref SiteOAC
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: site-s3
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          # AWS managed "CachingOptimized" policy; honors our per-object
+          # Cache-Control (data/*.json is max-age=60).
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${SiteBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution.Id}'
+
+Outputs:
+  DashboardUrl:
+    Description: Public HTTPS dashboard URL.
+    Value: !Sub 'https://${Distribution.DomainName}'
+  SiteBucketName:
+    Description: Bucket holding the static site + data feed (sync the dashboard here).
+    Value: !Ref SiteBucket
+  StateBucketName:
+    Description: Private bucket holding collector state.
+    Value: !Ref StateBucket
+  CollectorFunction:
+    Description: The scheduled collector Lambda (invoke once to seed data).
+    Value: !Ref Collector
