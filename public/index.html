@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>JCP&L ETR Accuracy Tracker</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1 id="utility">Outage ETR Accuracy Tracker</h1>
+        <p class="sub">
+          Grading how accurate the utility's estimated restoration times are —
+          in aggregate.
+          <a id="source" href="#" target="_blank" rel="noopener">source ↗</a>
+        </p>
+      </div>
+      <div class="topbar-right">
+        <span id="mode-badge" class="badge">—</span>
+        <span id="updated" class="muted">—</span>
+        <button id="collect" class="btn">Collect now</button>
+      </div>
+    </header>
+
+    <main>
+      <!-- Live snapshot -->
+      <section class="panel">
+        <h2>Right now</h2>
+        <div class="tiles" id="live-tiles"></div>
+        <div class="chart-wrap">
+          <div class="chart-head">
+            <h3>Customers out over the collection window</h3>
+            <span class="muted" id="ts-range"></span>
+          </div>
+          <div id="timeseries" class="chart"></div>
+        </div>
+      </section>
+
+      <!-- Accuracy -->
+      <section class="panel">
+        <div class="chart-head">
+          <h2>ETR accuracy</h2>
+          <label class="muted win">
+            on-time window ±
+            <select id="window">
+              <option value="30">30 min</option>
+              <option value="60" selected>1 hour</option>
+              <option value="120">2 hours</option>
+              <option value="180">3 hours</option>
+            </select>
+          </label>
+        </div>
+        <div id="accuracy-body"></div>
+      </section>
+
+      <!-- Current outages -->
+      <section class="panel">
+        <div class="chart-head">
+          <h2>Current outages</h2>
+          <span class="muted" id="current-count"></span>
+        </div>
+        <div class="table-wrap">
+          <table id="current-table">
+            <thead>
+              <tr>
+                <th>Area</th>
+                <th>County</th>
+                <th class="num">Customers out</th>
+                <th class="num">Outages</th>
+                <th>Current ETR</th>
+                <th class="num">ETR revisions</th>
+                <th>Out since</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+
+      <footer class="muted">
+        Restoration time is observed between polls, so each actual-restoration
+        estimate carries a <span id="uncertainty">±?</span> min timing band.
+        Data collected locally from the public outage feed; not affiliated with
+        the utility.
+      </footer>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,19 @@
+{
+  "name": "power-tracker",
+  "version": "1.0.0",
+  "description": "Tracks JCP&L / FirstEnergy outage ETRs over time and grades how accurate their restoration estimates are in aggregate.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "collect": "node src/collector.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.8.1",
+    "express": "^4.21.2",
+    "undici": "^7.3.0"
+  }
+}
