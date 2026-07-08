@@ -56,10 +56,14 @@ jobs:
         run: |
           mkdir -p .state
           cd .state
-          if [ ! -d .git ]; then
-            git init -b data .
+          [ -d .git ] || git init -b data .
+          # When the data branch doesn't exist yet, the restore step above
+          # fails mid-checkout and leaves a half-configured repo (auth set up,
+          # HEAD on the wrong unborn branch) — point HEAD at data explicitly
+          # so the poll commit always lands on the right branch.
+          git symbolic-ref HEAD refs/heads/data
+          git remote get-url origin >/dev/null 2>&1 || \
             git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          fi
           git config user.name 'power-tracker collector'
           git config user.email 'actions@users.noreply.github.com'
 
