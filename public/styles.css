@@ -132,6 +132,12 @@ main {
   gap: 12px;
   margin-bottom: 14px;
 }
+.controls {
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+  flex-wrap: wrap;
+}
 .win select {
   background: var(--panel);
   color: var(--ink);

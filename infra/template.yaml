@@ -23,11 +23,23 @@ Parameters:
   KubraViewId:
     Type: String
     Default: fcd7c23d-de37-4471-8ca3-37c3260f94fa
+  AlertEmail:
+    Type: String
+    Default: ''
+    Description: >
+      Optional. Email address to notify when the collector is failing or has
+      stopped running (data gaps hurt the accuracy stats). Leave blank to
+      create the alarms without notifications.
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
 
 Globals:
   Function:
     Runtime: nodejs22.x
-    Timeout: 60
+    # The collector makes ~5 sequential feed requests, each with a 30s client
+    # timeout — 60s could cut a slow-but-recoverable poll short.
+    Timeout: 120
     MemorySize: 256
 
 Resources:
@@ -42,6 +54,9 @@ Resources:
         RestrictPublicBuckets: true
 
   # Private bucket: the collector's running state (never exposed to browsers).
+  # state.json is the entire collected history in a single object, rewritten
+  # every poll — versioning means one corrupt write can't destroy it. Old
+  # versions are expired to keep storage costs at pennies.
   StateBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -50,6 +65,14 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-state-versions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
 
   Collector:
     Type: AWS::Serverless::Function
@@ -78,6 +101,53 @@ Resources:
             Schedule: !Sub 'rate(${PollMinutes} minutes)'
             Name: !Sub '${AWS::StackName}-poll'
             Description: Scheduled outage-feed poll.
+
+  # A tracker with data gaps can't fairly grade anyone, so collection failures
+  # should be loud. Both alarms notify AlertTopic when an email is configured.
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasAlertEmail
+    Properties:
+      Subscription:
+        - Endpoint: !Ref AlertEmail
+          Protocol: email
+
+  CollectorErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        Collector Lambda failing repeatedly — outage data is not being recorded.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref Collector
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlertEmail, [!Ref AlertTopic], []]
+
+  # Catches the schedule silently stopping (assumes PollMinutes <= 60).
+  CollectorSilentAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        Collector has not run in the last hour — the schedule may be broken.
+      Namespace: AWS/Lambda
+      MetricName: Invocations
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref Collector
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: !If [HasAlertEmail, [!Ref AlertTopic], []]
 
   SiteOAC:
     Type: AWS::CloudFront::OriginAccessControl
@@ -131,6 +201,9 @@ Outputs:
   DashboardUrl:
     Description: Public HTTPS dashboard URL.
     Value: !Sub 'https://${Distribution.DomainName}'
+  DistributionId:
+    Description: CloudFront distribution id (for cache invalidation on redeploys).
+    Value: !Ref Distribution
   SiteBucketName:
     Description: Bucket holding the static site + data feed (sync the dashboard here).
     Value: !Ref SiteBucket

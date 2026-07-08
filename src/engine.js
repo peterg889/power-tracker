@@ -121,6 +121,15 @@ export function estimatedResolution(ep) {
   return Math.round((ep.lastSeenTs + ep.resolvedTs) / 2);
 }
 
+// A snapshot whose summary claims customers out while the report lists zero
+// affected areas is almost certainly a feed glitch (the two files are generated
+// separately). Folding it in would mass-resolve every open episode with a bogus
+// restoration time, permanently poisoning the accuracy stats — so the collector
+// skips these and retries next cycle.
+export function snapshotLooksSuspect(snap) {
+  return Boolean(snap.totals && snap.totals.custOut > 0 && snap.areas.length === 0);
+}
+
 // ---------------- analytics ----------------
 
 export function gradedEpisodes(state) {
@@ -142,11 +151,17 @@ export function gradedEpisodes(state) {
         finalErrorMin: Math.round((actual - ep.finalEtr) / MIN),
         firstErrorMin:
           ep.firstEtr != null ? Math.round((actual - ep.firstEtr) / MIN) : null,
+        // How long the episode went unobserved before it was found resolved.
+        // The true restoration lies somewhere in this window, so a large gap
+        // (collector downtime) means the error is too uncertain to grade.
+        gapMin: Math.round((ep.resolvedTs - ep.lastSeenTs) / MIN),
         etrRevisions: ep.etrRevisions,
         peakCustA: ep.peakCustA,
         peakNOut: ep.peakNOut,
         durationMin: Math.round((actual - ep.startTs) / MIN),
         promisedLeadMin: Math.round((ep.finalEtr - ep.startTs) / MIN),
+        firstLeadMin:
+          ep.firstEtr != null ? Math.round((ep.firstEtr - ep.startTs) / MIN) : null,
       };
     })
     .sort((a, b) => b.resolvedTs - a.resolvedTs);
@@ -177,49 +192,77 @@ export function windowRates(errors, onTimeWindowMin) {
   };
 }
 
-export function accuracySummary(state, { onTimeWindowMin = 60 } = {}) {
-  const eps = gradedEpisodes(state);
-  const n = eps.length;
-  const base = { gradedCount: n, onTimeWindowMin };
-  if (n === 0) {
+// Distribution stats over an array of signed error minutes.
+function errorStats(errors) {
+  const n = errors.length;
+  if (!n) {
     return {
-      ...base,
       meanErrorMin: null,
       medianErrorMin: null,
       medianAbsErrorMin: null,
       p10ErrorMin: null,
       p90ErrorMin: null,
+    };
+  }
+  const sorted = [...errors].sort((a, b) => a - b);
+  const absSorted = errors.map(Math.abs).sort((a, b) => a - b);
+  return {
+    meanErrorMin: round1(errors.reduce((s, x) => s + x, 0) / n),
+    medianErrorMin: round1(quantile(sorted, 0.5)),
+    medianAbsErrorMin: round1(quantile(absSorted, 0.5)),
+    p10ErrorMin: round1(quantile(sorted, 0.1)),
+    p90ErrorMin: round1(quantile(sorted, 0.9)),
+  };
+}
+
+// Accuracy is graded on two bases:
+//   final — the utility's last promise before restoration (their official word)
+//   first — the promise customers originally planned around; a utility that
+//           quietly revises ETRs at the last minute scores well on `final`
+//           but poorly on `first`, which is exactly the gap worth surfacing.
+// Episodes observed across a collection gap wider than maxGapMin are excluded
+// (the actual restoration time is too uncertain to score fairly) and counted
+// in excludedForGapCount.
+export function accuracySummary(state, { onTimeWindowMin = 60, maxGapMin = Infinity } = {}) {
+  const all = gradedEpisodes(state);
+  const eps = all.filter((e) => e.gapMin <= maxGapMin);
+  const n = eps.length;
+  const base = {
+    gradedCount: n,
+    excludedForGapCount: all.length - n,
+    onTimeWindowMin,
+    maxGapMin: Number.isFinite(maxGapMin) ? maxGapMin : null,
+  };
+  if (n === 0) {
+    return {
+      ...base,
+      final: errorStats([]),
+      first: errorStats([]),
       onTimeRate: null,
       lateRate: null,
       earlyRate: null,
       meanRevisions: null,
       totalCustomerEpisodes: 0,
-      histogram: [],
       byCounty: [],
       scatter: [],
     };
   }
-  const errors = eps.map((e) => e.finalErrorMin);
-  const sorted = [...errors].sort((a, b) => a - b);
-  const absSorted = errors.map(Math.abs).sort((a, b) => a - b);
-  const mean = errors.reduce((s, x) => s + x, 0) / n;
-  const rates = windowRates(errors, onTimeWindowMin);
+  const finalErrors = eps.map((e) => e.finalErrorMin);
+  const firstErrors = eps.map((e) => e.firstErrorMin).filter((e) => e != null);
 
   return {
     ...base,
-    meanErrorMin: round1(mean),
-    medianErrorMin: round1(quantile(sorted, 0.5)),
-    medianAbsErrorMin: round1(quantile(absSorted, 0.5)),
-    p10ErrorMin: round1(quantile(sorted, 0.1)),
-    p90ErrorMin: round1(quantile(sorted, 0.9)),
-    ...rates,
+    final: errorStats(finalErrors),
+    first: errorStats(firstErrors),
+    ...windowRates(finalErrors, onTimeWindowMin),
     meanRevisions: round1(eps.reduce((s, e) => s + e.etrRevisions, 0) / n),
     totalCustomerEpisodes: eps.reduce((s, e) => s + (e.peakCustA || 0), 0),
-    histogram: buildHistogram(errors),
     byCounty: byCounty(eps),
     scatter: eps.map((e) => ({
       promisedLeadMin: e.promisedLeadMin,
       errorMin: e.finalErrorMin,
+      firstLeadMin: e.firstLeadMin,
+      firstErrorMin: e.firstErrorMin,
       peakCustA: e.peakCustA,
       name: e.name,
       county: e.county,
@@ -227,36 +270,29 @@ export function accuracySummary(state, { onTimeWindowMin = 60 } = {}) {
   };
 }
 
-function buildHistogram(errors) {
-  const edges = [-Infinity, -720, -360, -180, -60, 0, 60, 180, 360, 720, Infinity];
-  const labels = [
-    '> 12h early', '6–12h early', '3–6h early', '1–3h early', '<1h early',
-    '<1h late', '1–3h late', '3–6h late', '6–12h late', '> 12h late',
-  ];
-  const counts = new Array(labels.length).fill(0);
-  for (const e of errors) {
-    for (let i = 0; i < labels.length; i++) {
-      if (e >= edges[i] && e < edges[i + 1]) { counts[i]++; break; }
-    }
-  }
-  return labels.map((label, i) => ({ label, count: counts[i] }));
-}
-
 function byCounty(eps) {
   const groups = new Map();
   for (const e of eps) {
     const key = e.county || 'Unknown';
     if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(e.finalErrorMin);
+    groups.get(key).push(e);
   }
   return [...groups.entries()]
-    .map(([county, errs]) => {
-      const s = [...errs].sort((a, b) => a - b);
+    .map(([county, group]) => {
+      const finals = group.map((e) => e.finalErrorMin).sort((a, b) => a - b);
+      const firsts = group
+        .map((e) => e.firstErrorMin)
+        .filter((e) => e != null)
+        .sort((a, b) => a - b);
       return {
         county,
-        count: errs.length,
-        medianErrorMin: round1(quantile(s, 0.5)),
-        meanErrorMin: round1(errs.reduce((a, b) => a + b, 0) / errs.length),
+        count: group.length,
+        medianErrorMin: round1(quantile(finals, 0.5)),
+        meanErrorMin: round1(finals.reduce((a, b) => a + b, 0) / finals.length),
+        medianFirstErrorMin: round1(quantile(firsts, 0.5)),
+        meanFirstErrorMin: firsts.length
+          ? round1(firsts.reduce((a, b) => a + b, 0) / firsts.length)
+          : null,
       };
     })
     .sort((a, b) => b.count - a.count);
@@ -323,14 +359,19 @@ export function timeseries(state, limit = 20000) {
 
 // Build the full set of JSON documents the dashboard reads. In the AWS deploy
 // these are written to S3 after every collection; locally the server serves the
-// same shapes. Accuracy is emitted window-independent (with a raw `errors`
-// array) so the client can recompute hit/late/early for any on-time window.
-export function buildOutputs(state) {
-  const acc = accuracySummary(state, { onTimeWindowMin: 60 });
+// same shapes. Accuracy is emitted window-independent (with raw `errors` /
+// `errorsFirst` arrays) so the client can recompute rates + the histogram for
+// any on-time window and either grading basis without a server round-trip.
+export function buildOutputs(state, { onTimeWindowMin = 60, maxGapMin = Infinity } = {}) {
+  const acc = accuracySummary(state, { onTimeWindowMin, maxGapMin });
   return {
     status: status(state),
     current: currentOutages(state),
     timeseries: timeseries(state),
-    accuracy: { ...acc, errors: acc.scatter.map((s) => s.errorMin) },
+    accuracy: {
+      ...acc,
+      errors: acc.scatter.map((s) => s.errorMin),
+      errorsFirst: acc.scatter.map((s) => s.firstErrorMin).filter((e) => e != null),
+    },
   };
 }

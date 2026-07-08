@@ -84,7 +84,7 @@ async function fetchSourcePaths(deploymentId) {
 // Recursively collect leaf areas (the deepest level, typically township /
 // municipality) from the nested report structure. Leaf = an area node that
 // has no child `areas` array.
-function collectLeafAreas(node, acc) {
+export function collectLeafAreas(node, acc) {
   if (!node || typeof node !== 'object') return;
   const children = node.areas;
   if (Array.isArray(children) && children.length > 0) {
@@ -115,7 +115,7 @@ function collectLeafAreas(node, acc) {
 // like "Assessing" / "TBD" during storm assessment. Those parse to null so
 // they don't corrupt the accuracy math (an area with no real ETR is tracked
 // but excluded from grading).
-function parseEtr(raw) {
+export function parseEtr(raw) {
   if (raw == null) return null;
   if (typeof raw !== 'string') return null;
   const t = Date.parse(raw);

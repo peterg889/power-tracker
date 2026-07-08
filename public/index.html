@@ -41,15 +41,24 @@
       <section class="panel">
         <div class="chart-head">
           <h2>ETR accuracy</h2>
-          <label class="muted win">
-            on-time window ±
-            <select id="window">
-              <option value="30">30 min</option>
-              <option value="60" selected>1 hour</option>
-              <option value="120">2 hours</option>
-              <option value="180">3 hours</option>
-            </select>
-          </label>
+          <span class="controls">
+            <label class="muted win">
+              grading the
+              <select id="basis">
+                <option value="final" selected>final promise</option>
+                <option value="first">first promise</option>
+              </select>
+            </label>
+            <label class="muted win">
+              on-time window ±
+              <select id="window">
+                <option value="30">30 min</option>
+                <option value="60" selected>1 hour</option>
+                <option value="120">2 hours</option>
+                <option value="180">3 hours</option>
+              </select>
+            </label>
+          </span>
         </div>
         <div id="accuracy-body"></div>
       </section>
@@ -81,8 +90,9 @@
       <footer class="muted">
         Restoration time is observed between polls, so each actual-restoration
         estimate carries a <span id="uncertainty">±?</span> min timing band.
-        Data collected locally from the public outage feed; not affiliated with
-        the utility.
+        Outages that resolved during a collection gap are excluded from grading
+        rather than scored on a guess. Data collected automatically from the
+        public outage feed; not affiliated with the utility.
       </footer>
     </main>
 

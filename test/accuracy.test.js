@@ -10,6 +10,7 @@ import {
   accuracySummary,
   status,
   buildOutputs,
+  snapshotLooksSuspect,
 } from '../src/engine.js';
 
 const T0 = 1700000000000;
@@ -94,17 +95,50 @@ test('episode grading, revisions, and open/no-ETR exclusion', () => {
   // B: last_seen T0+30m, gone T0+60m -> actual T0+45m; final ETR T0+90m -> -45 early, 1 revision
   const acc60 = accuracySummary(s, { onTimeWindowMin: 60 });
   assert.equal(acc60.gradedCount, 2);
-  assert.equal(acc60.meanErrorMin, -15);
-  assert.equal(acc60.medianErrorMin, -15);
+  assert.equal(acc60.excludedForGapCount, 0);
+  assert.equal(acc60.final.meanErrorMin, -15);
+  assert.equal(acc60.final.medianErrorMin, -15);
   assert.equal(acc60.onTimeRate, 1);
   assert.equal(acc60.lateRate, 0);
   assert.equal(acc60.earlyRate, 0);
   assert.equal(acc60.meanRevisions, 0.5);
 
+  // First-promise basis: B's FIRST ETR was T0+120m, actual T0+45m -> -75 early.
+  // A never revised, so first == final -> +15.
+  assert.equal(acc60.first.meanErrorMin, -30);
+  assert.equal(acc60.first.medianErrorMin, -30);
+
   const acc10 = accuracySummary(s, { onTimeWindowMin: 10 });
   assert.equal(acc10.onTimeRate, 0);
   assert.equal(acc10.lateRate, 0.5);
   assert.equal(acc10.earlyRate, 0.5);
+});
+
+test('episodes resolved across a large collection gap are excluded from grading', () => {
+  const s = createState();
+  applySnapshot(s, snap(T0, [{ areaId: 'A', custA: 50, etr: T0 + 60 * MIN }]));
+  // Collector goes dark for 6 hours; A is gone when polling resumes.
+  applySnapshot(s, snap(T0 + 360 * MIN, []));
+
+  const strict = accuracySummary(s, { maxGapMin: 45 });
+  assert.equal(strict.gradedCount, 0, 'gap of 360 min exceeds 45 min cap');
+  assert.equal(strict.excludedForGapCount, 1);
+
+  const lax = accuracySummary(s, { maxGapMin: 720 });
+  assert.equal(lax.gradedCount, 1);
+  assert.equal(lax.excludedForGapCount, 0);
+});
+
+test('snapshotLooksSuspect flags customers-out-with-no-areas glitches', () => {
+  const bad = snap(T0, []);
+  bad.totals.custOut = 4200;
+  assert.equal(snapshotLooksSuspect(bad), true);
+
+  const genuinelyClear = snap(T0, []);
+  assert.equal(snapshotLooksSuspect(genuinelyClear), false, 'custOut 0 + no areas is fine');
+
+  const normal = snap(T0, [{ areaId: 'A', custA: 10 }]);
+  assert.equal(snapshotLooksSuspect(normal), false);
 });
 
 test('re-outage creates a second episode for the same area', () => {

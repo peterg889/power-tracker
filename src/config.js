@@ -38,6 +38,14 @@ export const config = {
   get resolutionUncertaintyMinutes() {
     return this.pollMinutes;
   },
+
+  // If the collector was down and an episode resolved during the gap, the
+  // actual restoration time is only known to within that whole gap. Episodes
+  // whose unobserved window exceeds this are excluded from grading (but
+  // counted, so the exclusion itself is visible). Default: 3 poll intervals.
+  get maxGapMinutes() {
+    return Number(process.env.MAX_GAP_MINUTES || this.pollMinutes * 3);
+  },
 };
 
 // The subset of config exposed to the browser dashboard.
@@ -47,5 +55,6 @@ export function publicConfig() {
     sourceUrl: config.sourceUrl,
     pollMinutes: config.pollMinutes,
     resolutionUncertaintyMinutes: config.resolutionUncertaintyMinutes,
+    maxGapMinutes: config.maxGapMinutes,
   };
 }

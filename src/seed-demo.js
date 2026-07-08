@@ -11,7 +11,7 @@
 
 import { createState, applySnapshot, buildOutputs } from './engine.js';
 import { FileStore } from './store.js';
-import { publicConfig } from './config.js';
+import { config, publicConfig } from './config.js';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -102,7 +102,7 @@ async function main() {
 
   const store = new FileStore(join(__dirname, '..', 'data', 'state.json'));
   await store.save(state);
-  const outputs = buildOutputs(state);
+  const outputs = buildOutputs(state, { maxGapMin: config.maxGapMinutes });
   outputs.config = { ...publicConfig(), generatedAt: horizon };
   await store.writeOutputs(outputs);
 

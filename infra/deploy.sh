@@ -8,6 +8,8 @@
 # Usage:
 #   ./infra/deploy.sh                 # deploy/update everything
 #   STACK=my-outages ./infra/deploy.sh
+#   ALERT_EMAIL=you@example.com ./infra/deploy.sh   # emailed if collection breaks
+#   POLL_MINUTES=10 ./infra/deploy.sh
 #
 # What it does:
 #   1. stages the Lambda bundle
@@ -34,7 +36,10 @@ sam deploy \
   --region "$REGION" \
   --capabilities CAPABILITY_IAM \
   --no-fail-on-empty-changeset \
-  --resolve-s3
+  --resolve-s3 \
+  --parameter-overrides \
+    "PollMinutes=${POLL_MINUTES:-15}" \
+    "AlertEmail=${ALERT_EMAIL:-}"
 
 get_output() {
   aws cloudformation describe-stacks --stack-name "$STACK" --region "$REGION" \
@@ -54,6 +59,13 @@ aws s3 sync "$ROOT/public" "s3://$SITE_BUCKET" \
   --cache-control "public, max-age=300" \
   --delete
 
+# Bust the CDN cache so redeployed assets show up immediately.
+DIST_ID="$(get_output DistributionId)"
+if [ -n "$DIST_ID" ]; then
+  aws cloudfront create-invalidation --distribution-id "$DIST_ID" \
+    --paths '/index.html' '/app.js' '/styles.css' '/' >/dev/null || true
+fi
+
 echo "==> [4/5] Seeding first data point (invoking collector once)"
 aws lambda invoke --function-name "$FUNCTION" --region "$REGION" \
   --cli-binary-format raw-in-base64-out /dev/stdout >/dev/null || \
@@ -63,5 +75,8 @@ echo "==> [5/5] Done."
 echo ""
 echo "    Dashboard:  $URL"
 echo "    Collector runs every ${POLL_MINUTES:-15} min. Accuracy fills in as outages resolve."
+if [ -n "${ALERT_EMAIL:-}" ]; then
+  echo "    Alerts:     confirm the SNS subscription email sent to $ALERT_EMAIL"
+fi
 echo ""
 echo "    (CloudFront can take a few minutes to finish provisioning on first deploy.)"

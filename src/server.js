@@ -22,7 +22,7 @@ const app = express();
 // Ensure the data/*.json the dashboard reads exist on boot (empty state is fine).
 async function ensureOutputs() {
   const state = await store.load();
-  const outputs = buildOutputs(state);
+  const outputs = buildOutputs(state, { maxGapMin: config.maxGapMinutes });
   outputs.config = { ...publicConfig(), generatedAt: Date.now() };
   await store.writeOutputs(outputs);
 }

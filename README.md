@@ -45,16 +45,37 @@ was gone. We estimate it at the **midpoint**, and surface the half-interval
 For each closed episode with an ETR on record:
 
 ```
-error = actual_restoration − final_promised_ETR
+error = actual_restoration − promised_ETR
   error > 0  → restored LATER than promised   (estimate was optimistic)
   error < 0  → restored EARLIER than promised  (beat the estimate)
 ```
+
+Accuracy is graded on **two bases**, switchable in the dashboard:
+
+- **final promise** — the last ETR published before restoration (the utility's
+  official last word), and
+- **first promise** — the ETR customers originally planned around. A utility
+  that quietly revises its estimate just before the lights come back scores
+  well on the final promise but poorly on the first one; the gap between the
+  two is exactly the honesty signal this tool exists to surface.
 
 The dashboard aggregates these into a median/mean error, an on-time rate
 (within an adjustable ± window), an early/late split, an error-distribution
 histogram, a promised-lead-time-vs-error scatter, and a per-county breakdown.
 The same township can have many episodes over time (a new storm = a new
 episode), so re-outages never get confused with the original.
+
+Two guardrails keep the scorecard itself honest:
+
+- **Suspect snapshots are rejected.** If the feed's summary claims customers
+  out while its report lists zero affected areas (the two files are generated
+  separately and can glitch independently), the poll is skipped rather than
+  mass-resolving every open episode with a bogus timestamp.
+- **Episodes resolved across a collection gap are excluded.** If the collector
+  was down and an outage cleared during the gap, the actual restoration time is
+  only known to within that whole gap — too uncertain to score fairly. Such
+  episodes are excluded from grading beyond `MAX_GAP_MINUTES` (default 3 poll
+  intervals) and the exclusion count is shown on the dashboard.
 
 ## Quick start
 
@@ -86,10 +107,47 @@ NO_SCHEDULER=1 npm start     # NO_SCHEDULER keeps the demo data (no live poll)
 > The demo numbers are invented to exercise the UI — they are **not** real
 > utility performance. Delete `data/state.json` and run live to collect real data.
 
-## Deploy to AWS (serverless, S3-hosted)
+## Deploy
 
-The natural home for this is fully serverless on AWS — no server to keep alive,
-pennies per month:
+Two supported paths, lightest first.
+
+### Option 1 — GitHub only (recommended, $0, no cloud account)
+
+Everything runs inside GitHub: an Actions workflow polls the feed on a cron,
+the running state lives as commits on an orphan **`data` branch**, and the
+dashboard (plus its JSON feed) publishes to **GitHub Pages**:
+
+```
+GitHub Actions (cron, ~15 min) → collector
+        ├─ state.json  → committed to the `data` branch  (git history = audit log)
+        └─ data/*.json → public/ → GitHub Pages (the static dashboard)
+```
+
+Setup (one time):
+
+1. Push the repo to GitHub, **public** (public repos get unlimited free Actions
+   minutes; a private repo would burn ~4,000 min/month against the 2,000 free —
+   stretch `POLL_MINUTES` to 30–60 if you must stay private).
+2. Repo **Settings → Pages → Source: "GitHub Actions"**.
+3. Actions tab → **collect** → *Run workflow* (or wait for the next cron tick).
+4. Dashboard appears at `https://<user>.github.io/<repo>/`.
+
+Why this fits this project unusually well: every poll is a timestamped commit,
+so the collected dataset is a **public, tamper-evident audit log** — anyone can
+verify the numbers weren't massaged after the fact. Failure alerting is free
+too: GitHub emails the workflow author when a scheduled run fails (including
+polls rejected by the suspect-snapshot guard).
+
+Caveats: GitHub cron is best-effort — runs can drift by minutes and are
+occasionally skipped under load. The tracker is built for that (real fetch
+timestamps, and the collection-gap exclusion keeps late polls from distorting
+grades). The `data` branch accrues ~96 small commits/day; if it ever bothers
+you, squash it — the dashboard only reads the latest state.
+
+### Option 2 — AWS serverless (S3 + Lambda + CloudFront)
+
+The heavier-duty path: precise scheduling, CDN hosting, CloudWatch alarms —
+no server to keep alive, roughly $1–2/month:
 
 ```
 EventBridge (every 15 min) → Lambda collector → S3
@@ -109,6 +167,7 @@ with credentials configured for your account (`aws configure`).
 
 ```bash
 ./infra/deploy.sh          # STACK=my-name AWS_REGION=us-east-1 to customize
+ALERT_EMAIL=you@example.com ./infra/deploy.sh   # + email alerts if collection breaks
 ```
 
 That single command creates the buckets, Lambda, 15-minute schedule, and
@@ -118,9 +177,30 @@ the Lambda is a pure-JS zip (no native modules, no `node_modules` — global
 `fetch` and the runtime-provided AWS SDK are all it needs). Tear down with
 `sam delete --stack-name <name>` (empty the buckets first).
 
-Other hosting options (Railway/Render/Fly for the always-on server, or Vercel +
-a hosted DB + external cron) also work, but the AWS/S3 path above is the
-recommended one.
+Operational safety nets built into the stack:
+
+- **CloudWatch alarms** fire when the collector errors repeatedly or stops
+  running for an hour (data gaps weaken the accuracy stats — see the gap
+  exclusion above). Set `ALERT_EMAIL` to get notified via SNS; remember to
+  confirm the subscription email.
+- **The state bucket is versioned** (30-day noncurrent expiry), so one corrupt
+  write of `state.json` — the entire collected history lives in that single
+  object — can be rolled back.
+- Redeploys invalidate the CloudFront cache for the static assets, so dashboard
+  updates show up immediately.
+
+### Other hosting options (not built out)
+
+- **Vercel**: free Hobby cron jobs only run **once per day** (with hour-level
+  timing), so a 15-minute poll needs an external trigger (e.g. a GitHub Actions
+  cron hitting a secret-protected `/api/collect` route) plus Vercel Blob for
+  state — two platforms and a storage adapter for what Option 1 does with one.
+  Native frequent cron requires the Pro plan.
+- **Cloudflare Workers**: free Cron Triggers at any frequency + KV for state +
+  Pages for the site — a genuinely good single-platform fit, but it needs a
+  KV storage adapter and another account.
+- **Railway / Render / Fly**: run `npm start` as an always-on server; simplest
+  mental model, but you're paying for 24/7 compute to do 4 fetches an hour.
 
 ## Configuration
 
@@ -133,6 +213,7 @@ All via environment variables (see `src/config.js`):
 | `STATE_PATH` | `data/state.json` | Local state file |
 | `S3_BUCKET` | — | If set, use S3 for the data feed instead of local files (enables the AWS path) |
 | `S3_STATE_BUCKET` | = `S3_BUCKET` | Private bucket for running state |
+| `MAX_GAP_MINUTES` | `3 × POLL_MINUTES` | Episodes resolved across a longer unobserved gap are excluded from grading |
 | `NO_SCHEDULER` | — | Set to `1` to disable the built-in poller |
 | `KUBRA_INSTANCE_ID` / `KUBRA_VIEW_ID` | JCP&L's | Point at another FirstEnergy operating company |
 | `UTILITY_NAME` / `SOURCE_URL` | JCP&L | UI labels |
@@ -144,14 +225,15 @@ Met-Ed, Penelec, West Penn, Ohio Edison, etc. — grab their `instanceId` /
 ## Data feed
 
 The dashboard reads these static JSON documents (published locally under
-`public/data/`, in production to `s3://<site-bucket>/data/`):
+`public/data/`; in production they ship inside the GitHub Pages artifact or to
+`s3://<site-bucket>/data/`, depending on the deploy path):
 
 | File | Contents |
 | --- | --- |
 | `config.json` | Utility labels + poll interval |
 | `status.json` | Collection status + latest snapshot totals |
 | `current.json` | Currently-open outages |
-| `accuracy.json` | Aggregate accuracy + a raw `errors` array (the on-time window is applied in the browser) |
+| `accuracy.json` | Aggregate accuracy on both bases (`final` / `first` stat blocks) + raw `errors` / `errorsFirst` arrays (the on-time window, grading basis, and histogram are applied in the browser) |
 | `timeseries.json` | Customers-out over the collection window |
 
 The local dev server additionally exposes `POST /api/collect` to trigger a poll
@@ -174,8 +256,10 @@ on demand.
 ## Development
 
 ```bash
-npm test           # verifies the episode lifecycle + accuracy math
+npm test           # episode lifecycle, accuracy math, and feed-parsing tests
 ```
+
+CI (GitHub Actions) runs the same suite on every push and pull request.
 
 ## Layout
 

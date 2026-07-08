@@ -3,16 +3,22 @@
 // file store or the S3 store. Reused by the dev server and the AWS Lambda.
 
 import { fetchSnapshot } from './kubra.js';
-import { applySnapshot, buildOutputs } from './engine.js';
+import { applySnapshot, buildOutputs, snapshotLooksSuspect } from './engine.js';
 import { makeStore } from './store.js';
-import { publicConfig } from './config.js';
+import { config, publicConfig } from './config.js';
 
 export async function collectOnce(store = makeStore()) {
   const state = await store.load();
   const snap = await fetchSnapshot();
+  if (snapshotLooksSuspect(snap)) {
+    throw new Error(
+      `suspect snapshot (custOut=${snap.totals.custOut} but 0 areas) — ` +
+        `skipping this poll to protect episode history`
+    );
+  }
   const result = applySnapshot(state, snap);
   await store.save(state);
-  const outputs = buildOutputs(state);
+  const outputs = buildOutputs(state, { maxGapMin: config.maxGapMinutes });
   outputs.config = { ...publicConfig(), generatedAt: snap.fetchedAt };
   await store.writeOutputs(outputs);
   return { snap, result, state, outputs };

@@ -25,6 +25,23 @@ function computeRates(errors, win) {
   return { onTimeRate: (n - late - early) / n, lateRate: late / n, earlyRate: early / n };
 }
 
+// Bucket signed error minutes for the distribution chart. Done client-side so
+// the grading-basis selector (first vs. final promise) works on static hosting.
+function buildHistogram(errors) {
+  const edges = [-Infinity, -720, -360, -180, -60, 0, 60, 180, 360, 720, Infinity];
+  const labels = [
+    '> 12h early', '6–12h early', '3–6h early', '1–3h early', '<1h early',
+    '<1h late', '1–3h late', '3–6h late', '6–12h late', '> 12h late',
+  ];
+  const counts = new Array(labels.length).fill(0);
+  for (const e of errors) {
+    for (let i = 0; i < labels.length; i++) {
+      if (e >= edges[i] && e < edges[i + 1]) { counts[i]++; break; }
+    }
+  }
+  return labels.map((label, i) => ({ label, count: counts[i] }));
+}
+
 // ---------- formatting ----------
 const nf = new Intl.NumberFormat('en-US');
 const fmtInt = (n) => (n == null ? '—' : nf.format(Math.round(n)));
@@ -188,7 +205,7 @@ function renderTimeseries(series) {
   $('#ts-range').textContent = `${series.length} points`;
 }
 
-function renderAccuracy(acc, status) {
+function renderAccuracy(acc, status, basis) {
   const body = $('#accuracy-body');
   body.innerHTML = '';
 
@@ -201,7 +218,6 @@ function renderAccuracy(acc, status) {
         'Collecting data — accuracy appears once outages resolve.'
       )
     );
-    const need = Math.max(0, 1 - status.gradedEpisodes);
     wrap.appendChild(
       el(
         'div',
@@ -220,16 +236,22 @@ function renderAccuracy(acc, status) {
     return;
   }
 
+  const stats = (basis === 'first' ? acc.first : acc.final) || {};
+  const otherStats = (basis === 'first' ? acc.final : acc.first) || {};
+  const otherLabel = basis === 'first' ? 'final promise' : 'first promise';
+  const promiseLabel = basis === 'first' ? 'first promise' : 'final promise';
+  const errors = (basis === 'first' ? acc.errorsFirst : acc.errors) || [];
+
   // Verdict tiles
   const v = el('div', 'verdict');
-  const med = acc.medianErrorMin;
+  const med = stats.medianErrorMin;
   const medCls = Math.abs(med) < 1 ? 'ontime' : med > 0 ? 'late' : 'early';
   const tiles = [
     {
-      k: 'Typical ETR error (median)',
+      k: `Typical error, ${promiseLabel} (median)`,
       v: fmtError(med),
       cls: medCls,
-      foot: 'positive = restored after the promised time',
+      foot: `${otherLabel}: ${fmtError(otherStats.medianErrorMin)}`,
     },
     {
       k: `Within ±${fmtDurMin(acc.onTimeWindowMin)}`,
@@ -241,7 +263,7 @@ function renderAccuracy(acc, status) {
       k: 'Restored late',
       v: `${Math.round(acc.lateRate * 100)}%`,
       cls: 'late',
-      foot: `median miss`,
+      foot: 'restored after the promised window',
     },
     {
       k: 'Restored early',
@@ -257,7 +279,11 @@ function renderAccuracy(acc, status) {
     {
       k: 'Outages graded',
       v: fmtInt(acc.gradedCount),
-      foot: `median |error| ${fmtDurMin(acc.medianAbsErrorMin)}`,
+      foot:
+        `median |error| ${fmtDurMin(stats.medianAbsErrorMin)}` +
+        (acc.excludedForGapCount
+          ? ` · ${fmtInt(acc.excludedForGapCount)} excluded (collection gap)`
+          : ''),
     },
   ];
   for (const t of tiles) {
@@ -272,17 +298,22 @@ function renderAccuracy(acc, status) {
   // Charts split: histogram + scatter
   const split = el('div', 'split');
   const h1 = el('div', 'chart-wrap');
-  h1.appendChild(el('h3', null, 'Distribution of ETR error'));
-  h1.appendChild(histogram(acc.histogram));
+  h1.appendChild(el('h3', null, `Distribution of ETR error (${promiseLabel})`));
+  h1.appendChild(histogram(buildHistogram(errors)));
   const leg = el('div', 'legend');
   leg.appendChild(el('span', 'l-early', 'restored early'));
   leg.appendChild(el('span', 'l-late', 'restored late'));
   h1.appendChild(leg);
   split.appendChild(h1);
 
+  const points = (acc.scatter || []).map((p) => ({
+    ...p,
+    leadMin: basis === 'first' ? p.firstLeadMin : p.promisedLeadMin,
+    plotErrorMin: basis === 'first' ? p.firstErrorMin : p.errorMin,
+  })).filter((p) => p.leadMin != null && p.plotErrorMin != null);
   const h2 = el('div', 'chart-wrap');
   h2.appendChild(el('h3', null, 'Promised lead time vs. error'));
-  h2.appendChild(scatter(acc.scatter || []));
+  h2.appendChild(scatter(points));
   h2.appendChild(
     el('div', 'muted', 'each dot = one resolved outage; size = peak customers')
   );
@@ -302,8 +333,12 @@ function renderAccuracy(acc, status) {
       const tr = document.createElement('tr');
       tr.appendChild(el('td', null, c.county));
       tr.appendChild(el('td', 'num', fmtInt(c.count)));
-      tr.appendChild(el('td', 'num', fmtError(c.medianErrorMin)));
-      tr.appendChild(el('td', 'num', fmtError(c.meanErrorMin)));
+      tr.appendChild(
+        el('td', 'num', fmtError(basis === 'first' ? c.medianFirstErrorMin : c.medianErrorMin))
+      );
+      tr.appendChild(
+        el('td', 'num', fmtError(basis === 'first' ? c.meanFirstErrorMin : c.meanErrorMin))
+      );
       tb.appendChild(tr);
     }
     t.appendChild(tb);
@@ -352,8 +387,8 @@ function scatter(points) {
     s.appendChild(text(W / 2, H / 2, 'no data', 'axis-text', 'middle'));
     return s;
   }
-  const xs = points.map((p) => p.promisedLeadMin);
-  const ys = points.map((p) => p.errorMin);
+  const xs = points.map((p) => p.leadMin);
+  const ys = points.map((p) => p.plotErrorMin);
   const xmax = Math.max(60, ...xs);
   const ymax = Math.max(60, ...ys.map((y) => Math.abs(y)));
   const X = (v) => pad.l + (v / xmax) * (W - pad.l - pad.r);
@@ -372,14 +407,14 @@ function scatter(points) {
   const maxCust = Math.max(1, ...points.map((p) => p.peakCustA || 0));
   for (const p of points) {
     const c = document.createElementNS(SVGNS, 'circle');
-    c.setAttribute('cx', X(Math.max(0, p.promisedLeadMin)).toFixed(1));
-    c.setAttribute('cy', Y(p.errorMin).toFixed(1));
+    c.setAttribute('cx', X(Math.max(0, p.leadMin)).toFixed(1));
+    c.setAttribute('cy', Y(p.plotErrorMin).toFixed(1));
     const r = 3 + 6 * Math.sqrt((p.peakCustA || 0) / maxCust);
     c.setAttribute('r', r.toFixed(1));
-    c.setAttribute('fill', p.errorMin > 0 ? late : early);
+    c.setAttribute('fill', p.plotErrorMin > 0 ? late : early);
     c.setAttribute('opacity', '0.6');
     const title = document.createElementNS(SVGNS, 'title');
-    title.textContent = `${p.name || p.county}: ${fmtError(p.errorMin)}, ${fmtInt(p.peakCustA)} out`;
+    title.textContent = `${p.name || p.county}: ${fmtError(p.plotErrorMin)}, ${fmtInt(p.peakCustA)} out`;
     c.appendChild(title);
     s.appendChild(c);
   }
@@ -421,6 +456,7 @@ function renderCurrent(rows) {
 // ---------- orchestration ----------
 async function refresh() {
   const win = Number($('#window').value);
+  const basis = $('#basis').value;
   const [status, acc, current, ts] = await Promise.all([
     data('status'),
     data('accuracy'),
@@ -428,9 +464,10 @@ async function refresh() {
     data('timeseries'),
   ]);
 
-  // Apply the selected on-time window client-side.
+  // Apply the selected on-time window + grading basis client-side.
   acc.onTimeWindowMin = win;
-  Object.assign(acc, computeRates(acc.errors || [], win));
+  const errors = (basis === 'first' ? acc.errorsFirst : acc.errors) || [];
+  Object.assign(acc, computeRates(errors, win));
 
   const l = status.latest || {};
   $('#updated').textContent = l.fetchedAt
@@ -442,7 +479,7 @@ async function refresh() {
 
   renderLiveTiles(status);
   renderTimeseries(ts);
-  renderAccuracy(acc, status);
+  renderAccuracy(acc, status, basis);
   renderCurrent(current);
 }
 
@@ -457,6 +494,7 @@ async function init() {
   } catch {}
 
   $('#window').addEventListener('change', () => refresh().catch(console.error));
+  $('#basis').addEventListener('change', () => refresh().catch(console.error));
   // "Collect now" works against the local dev server. On the static S3 deploy
   // there is no collect endpoint (a Lambda polls on a schedule), so the button
   // gracefully retires itself.

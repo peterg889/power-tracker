@@ -1,0 +1,93 @@
+# The zero-infrastructure deploy: GitHub Actions polls the outage feed on a
+# cron, the running state lives as commits on an orphan `data` branch (every
+# poll is a timestamped commit — a public, tamper-evident audit log of the
+# collected data), and the dashboard + its JSON feed publish to GitHub Pages.
+#
+# One-time setup: repo Settings → Pages → Source: "GitHub Actions".
+#
+# Notes:
+#  - GitHub cron is best-effort (runs can drift by minutes or occasionally be
+#    skipped). That's fine here: the collector stamps real fetch times, and
+#    episodes resolved across an oversized gap are excluded from grading.
+#  - The per-poll commits on the data branch count as repository activity, so
+#    the 60-day scheduled-workflow auto-disable never triggers while the
+#    collector is healthy.
+#  - A failing run (feed down, suspect snapshot rejected) emails the workflow
+#    author — that's the alerting story, no extra service needed.
+
+name: collect
+
+on:
+  schedule:
+    # Every 15 min, offset from :00 to dodge GitHub's top-of-hour congestion.
+    - cron: '7,22,37,52 * * * *'
+  workflow_dispatch: {}
+
+# Collection is a read-modify-write on state — never run two at once.
+concurrency:
+  group: collect
+  cancel-in-progress: false
+
+permissions:
+  contents: write # push poll commits to the data branch
+  pages: write # publish the dashboard
+  id-token: write # required by deploy-pages
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore state from the data branch
+        uses: actions/checkout@v4
+        with:
+          ref: data
+          path: .state
+        continue-on-error: true # first run ever: the branch doesn't exist yet
+
+      - name: Init state store
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p .state
+          cd .state
+          if [ ! -d .git ]; then
+            git init -b data .
+            git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          fi
+          git config user.name 'power-tracker collector'
+          git config user.email 'actions@users.noreply.github.com'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # No npm install: on the file-store path the collector is dependency-free
+      # (global fetch + node builtins only).
+      - name: Collect one snapshot
+        env:
+          STATE_PATH: ${{ github.workspace }}/.state/state.json
+        run: node src/collector.js
+
+      - name: Commit state to the data branch
+        run: |
+          cd .state
+          git add state.json
+          git commit -m "poll $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || { echo 'state unchanged'; exit 0; }
+          git push origin data
+
+      # The file store wrote the refreshed data/*.json into public/, so the
+      # site artifact is simply the public directory.
+      - name: Upload site
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
