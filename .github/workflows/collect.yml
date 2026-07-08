@@ -73,9 +73,14 @@ jobs:
 
       # No npm install: on the file-store path the collector is dependency-free
       # (global fetch + node builtins only).
+      # HOME_LAT/HOME_LON are repo secrets: the home-watch coordinates stay
+      # out of the public repo; the published home.json carries only
+      # covered/clear status and distances.
       - name: Collect one snapshot
         env:
           STATE_PATH: ${{ github.workspace }}/.state/state.json
+          HOME_LAT: ${{ secrets.HOME_LAT }}
+          HOME_LON: ${{ secrets.HOME_LON }}
         run: node src/collector.js
 
       - name: Commit state to the data branch

@@ -11,6 +11,7 @@
 // The report's township-level ETR is the unit we grade for accuracy.
 
 import { config } from './config.js';
+import { quadkey, quadkeyShard, decodePolyline } from './geo.js';
 
 // Route through the agent proxy when present (remote/dev sandboxes set
 // HTTPS_PROXY). On a normal machine no proxy env is set and this is a no-op,
@@ -39,6 +40,19 @@ async function getJson(url) {
   return res.json();
 }
 
+// Cluster (geometry) tiles only exist where outage features are: a 404 means
+// "no outages intersect this tile", not an error.
+async function getJsonOrNull(url) {
+  await ensureDispatcher();
+  const res = await fetch(url, {
+    headers: { accept: 'application/json,*/*' },
+    signal: AbortSignal.timeout(30000),
+  });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`GET ${url} -> HTTP ${res.status}`);
+  return res.json();
+}
+
 function apiBase() {
   return `${config.host}/stormcenter/api/v1/stormcenters/${config.instanceId}/views/${config.viewId}`;
 }
@@ -56,6 +70,8 @@ async function fetchCurrentState() {
     intervalPath,
     deploymentId,
     updatedAt: state?.updatedAt ?? null,
+    // Quadkey-templated path to the map's geometry (cluster) tiles.
+    clusterPath: state?.data?.cluster_interval_generation_data ?? null,
   };
 }
 
@@ -127,9 +143,97 @@ function numberOrZero(v) {
   return Number.isFinite(n) ? n : 0;
 }
 
+// Enumerate every individual outage geometry in the territory by walking the
+// cluster tile pyramid: seed at zoom 8 over the service-area bounding box and
+// descend only into tiles that still contain cluster (aggregated) entries.
+// Sparse areas terminate immediately, so a blue-sky walk is ~20-60 requests;
+// tiles are exactly what every map visitor's browser fetches while panning.
+//
+// Returns normalized individual outages. Entries that are still clusters at
+// max zoom (outages too close to separate) are returned in `clusterLeaves` so
+// the caller can keep nearby episodes alive without guessing identities.
+const WALK_SEED_ZOOM = 8;
+const WALK_MAX_ZOOM = 14;
+
+export async function fetchOutageGeometries(clusterPath, { maxTiles = 800 } = {}) {
+  if (!clusterPath) throw new Error('feed exposes no cluster geometry path');
+  const [minLat, minLon, maxLat, maxLon] = config.territoryBbox;
+
+  const seeds = new Set();
+  const step = 0.4; // < a z8 tile (~1.4° lon), so the bbox cover has no holes
+  for (let lat = minLat; lat <= maxLat + step; lat += step) {
+    for (let lon = minLon; lon <= maxLon + step; lon += step) {
+      seeds.add(quadkey(Math.min(lat, maxLat), Math.min(lon, maxLon), WALK_SEED_ZOOM));
+    }
+  }
+
+  let fetches = 0;
+  const raw = [];
+  const clusterLeaves = [];
+
+  const walk = async (q) => {
+    if (++fetches > maxTiles) {
+      throw new Error(`cluster tile walk exceeded ${maxTiles} tiles`);
+    }
+    const url = `${config.host}/${clusterPath.replace('{qkh}', quadkeyShard(q))}/public/cluster-7/${q}.json`;
+    const tile = await getJsonOrNull(url);
+    if (!tile) return;
+    const entries = tile.file_data || [];
+    if (entries.some((e) => e.desc?.cluster) && q.length < WALK_MAX_ZOOM) {
+      await Promise.all([0, 1, 2, 3].map((d) => walk(q + d)));
+      return;
+    }
+    for (const e of entries) {
+      if (e.desc?.cluster) clusterLeaves.push(e);
+      else raw.push(e);
+    }
+  };
+
+  await Promise.all([...seeds].map((q) => walk(q)));
+
+  // Features repeat in every tile they intersect — dedupe on geometry.
+  const seen = new Set();
+  const outages = [];
+  for (const e of raw) {
+    const key = JSON.stringify(e.geom || {});
+    if (seen.has(key) || !e.geom) continue;
+    seen.add(key);
+    const d = e.desc || {};
+    const pts = (e.geom.p || []).flatMap(decodePolyline);
+    const rings = (e.geom.a || []).map(decodePolyline);
+    let point = pts[0] ?? null;
+    if (!point && rings[0]?.length) {
+      const ring = rings[0];
+      point = [
+        ring.reduce((s, p) => s + p[0], 0) / ring.length,
+        ring.reduce((s, p) => s + p[1], 0) / ring.length,
+      ];
+    }
+    if (!point) continue;
+    outages.push({
+      point: [Number(point[0].toFixed(5)), Number(point[1].toFixed(5))],
+      geomA: e.geom.a || [],
+      custA: numberOrZero(d.cust_a?.val),
+      nOut: numberOrZero(d.n_out),
+      etr: parseEtr(d.etr),
+      cause: d.cause?.['EN-US'] ?? d.cause?.orig ?? null,
+      crewStatus: d.crew_status?.orig ?? null,
+    });
+  }
+
+  const clusterPoints = [];
+  for (const e of clusterLeaves) {
+    for (const p of (e.geom?.p || []).flatMap(decodePolyline)) {
+      clusterPoints.push([p[0], p[1]]);
+    }
+  }
+
+  return { outages, clusterPoints, fetches };
+}
+
 // Fetch one complete snapshot of the outage feed.
 export async function fetchSnapshot() {
-  const { intervalPath, deploymentId, updatedAt } = await fetchCurrentState();
+  const { intervalPath, deploymentId, updatedAt, clusterPath } = await fetchCurrentState();
   const { summarySource, reportSources } = await fetchSourcePaths(deploymentId);
 
   let totals = null;
@@ -166,6 +270,7 @@ export async function fetchSnapshot() {
     fetchedAt: Date.now(),
     generatedAt,
     intervalId: intervalPath,
+    clusterPath,
     updatedAt,
     pageMode,
     totals,

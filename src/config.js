@@ -46,6 +46,39 @@ export const config = {
   get maxGapMinutes() {
     return Number(process.env.MAX_GAP_MINUTES || this.pollMinutes * 3);
   },
+
+  // "Home watch": GIS test of the feed's outage geometry (polygons + point
+  // markers) against one fixed location each poll. The coordinates are
+  // intentionally env-only — set them as CI secrets, never in this file: the
+  // repo and dashboard are public, and the published home.json only carries
+  // covered/clear status and distances, not the location itself.
+  homeLat: process.env.HOME_LAT ? Number(process.env.HOME_LAT) : null,
+  homeLon: process.env.HOME_LON ? Number(process.env.HOME_LON) : null,
+  // A point outage (no polygon) this close is treated as affecting home.
+  homeRadiusM: Number(process.env.HOME_RADIUS_M || 250),
+  homeLabel: process.env.HOME_LABEL || 'Home',
+  // Township-level fallback + row highlighting: feed area names, optionally
+  // county-qualified as "COUNTY/NAME" (duplicate township names exist across
+  // NJ counties). Township granularity only — never a street address.
+  homeAreas: (process.env.HOME_AREAS || 'MORRIS/MENDHAM TOWNSHIP')
+    .split(',')
+    .map((s) => s.trim().toUpperCase())
+    .filter(Boolean),
+
+  get homeConfigured() {
+    return Number.isFinite(this.homeLat) && Number.isFinite(this.homeLon);
+  },
+
+  // Service-territory bounding box for the geometry tile walk
+  // (minLat,minLon,maxLat,maxLon). Default covers JCP&L's New Jersey area.
+  territoryBbox: (process.env.TERRITORY_BBOX || '39.2,-75.7,41.4,-73.85')
+    .split(',')
+    .map(Number),
+
+  // Two outage observations this close (meters) are treated as the same
+  // physical outage across polls. Used by the geometric (outage-level)
+  // tracker; polygon containment also links observations.
+  matchRadiusM: Number(process.env.MATCH_RADIUS_M || 150),
 };
 
 // The subset of config exposed to the browser dashboard.
@@ -56,5 +89,9 @@ export function publicConfig() {
     pollMinutes: config.pollMinutes,
     resolutionUncertaintyMinutes: config.resolutionUncertaintyMinutes,
     maxGapMinutes: config.maxGapMinutes,
+    homeConfigured: config.homeConfigured,
+    homeLabel: config.homeLabel,
+    homeRadiusM: config.homeRadiusM,
+    homeAreas: config.homeAreas,
   };
 }

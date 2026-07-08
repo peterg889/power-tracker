@@ -14,6 +14,18 @@ async function getJSON(url) {
 // Dashboard data is published as static JSON (by the local server or, in
 // production, by the S3-writing Lambda). Cache-bust so refreshes see new polls.
 const data = (name) => getJSON(`data/${name}.json?t=${Date.now()}`);
+// Tolerate documents that older deploys never published.
+const dataOrNull = (name) => data(name).catch(() => null);
+
+// Same semantics as the collector's matchesHomeArea: patterns are upper-case
+// area names, optionally county-qualified as "COUNTY/NAME".
+function isHomeArea(row) {
+  const pats = cfg.homeAreas || [];
+  if (!pats.length || !row.name) return false;
+  const n = String(row.name).toUpperCase();
+  const q = `${String(row.county || '').toUpperCase()}/${n}`;
+  return pats.some((p) => p === n || p === q);
+}
 
 // Recompute the window-dependent hit/late/early rates in the browser, so the
 // on-time-window selector needs no server round-trip (and works on static S3).
@@ -283,6 +295,9 @@ function renderAccuracy(acc, status, basis) {
         `median |error| ${fmtDurMin(stats.medianAbsErrorMin)}` +
         (acc.excludedForGapCount
           ? ` · ${fmtInt(acc.excludedForGapCount)} excluded (collection gap)`
+          : '') +
+        (acc.taintedCount
+          ? ` · ${fmtInt(acc.taintedCount)} excluded (geometry merged/split)`
           : ''),
     },
   ];
@@ -421,6 +436,80 @@ function scatter(points) {
   return s;
 }
 
+// The home panel: geometry-based status for the fixed home point (when the
+// collector runs with HOME_LAT/HOME_LON), plus a township-level line.
+function renderHome(home, current) {
+  const box = $('#home-note');
+  const geo = home && home.enabled;
+  const homeRows = (current || []).filter(isHomeArea);
+  if (!geo && !homeRows.length && !(cfg.homeAreas || []).length) {
+    box.hidden = true;
+    return;
+  }
+  box.hidden = false;
+  box.innerHTML = '';
+  const label = cfg.homeLabel || 'Home';
+
+  if (geo && home.current) {
+    const c = home.current;
+    box.className = 'home-note alert';
+    const where =
+      c.kind === 'polygon'
+        ? 'the home location is inside a reported outage area'
+        : `an outage is reported ${fmtInt(c.distM)} m from home`;
+    box.appendChild(el('div', 'big', `⚡ ${label}: power outage — ${where}`));
+    const bits = [];
+    bits.push(`out since ${fmtRel(c.startTs)}`);
+    if (c.custA) bits.push(`${fmtInt(c.custA)} customers affected nearby`);
+    if (c.etr) {
+      bits.push(
+        `promised restoration ${fmtClock(c.etr)} (${
+          c.etrSource === 'area' ? 'township-wide estimate' : 'outage-specific'
+        }${c.etrRevisions ? `, revised ×${c.etrRevisions}` : ''})`
+      );
+    } else {
+      bits.push('no restoration estimate given yet');
+    }
+    if (c.cause) bits.push(`cause: ${c.cause}`);
+    if (c.crewStatus) bits.push(`crew: ${c.crewStatus}`);
+    box.appendChild(el('div', null, bits.join(' · ')));
+  } else if (geo) {
+    box.className = 'home-note ok';
+    box.appendChild(el('div', 'big', `✓ ${label}: no outage at the home location`));
+    const lc = home.lastCheck || {};
+    const bits = [];
+    if (lc.nearestM != null) {
+      bits.push(
+        lc.nearestM < 1000
+          ? `nearest active outage ${fmtInt(lc.nearestM)} m away`
+          : `nearest active outage ${(lc.nearestM / 1000).toFixed(1)} km away`
+      );
+    }
+    if (lc.ts) bits.push(`geometry checked ${fmtRel(lc.ts)}`);
+    if (bits.length) box.appendChild(el('div', null, bits.join(' · ')));
+  } else {
+    box.className = 'home-note ok';
+    box.appendChild(el('div', 'big', `${label} area watch`));
+  }
+
+  // Township-level line (the grading altitude), regardless of geometry status.
+  const twp = [];
+  for (const r of homeRows) {
+    twp.push(`${r.name}: ${fmtInt(r.custOut)} customers out township-wide`);
+  }
+  if (!homeRows.length && (cfg.homeAreas || []).length) {
+    const names = cfg.homeAreas.map((p) => p.split('/').pop()).join(', ');
+    twp.push(`no active outage listed for ${names}`);
+  }
+  if (home && home.gradedCount) {
+    twp.push(
+      `track record here: ${fmtInt(home.gradedCount)} home outage${home.gradedCount > 1 ? 's' : ''} graded, ` +
+        `median final-promise error ${fmtError(home.medianFinalErrorMin)}`
+    );
+  }
+  if (twp.length) box.appendChild(el('div', 'muted', twp.join(' · ')));
+}
+
 function renderCurrent(rows) {
   const tb = $('#current-table tbody');
   tb.innerHTML = '';
@@ -433,9 +522,14 @@ function renderCurrent(rows) {
     tb.appendChild(tr);
     return;
   }
+  // Pin home-area rows to the top.
+  rows = [...rows.filter(isHomeArea), ...rows.filter((r) => !isHomeArea(r))];
   for (const r of rows) {
     const tr = document.createElement('tr');
-    tr.appendChild(el('td', null, r.name || r.areaId));
+    if (isHomeArea(r)) tr.className = 'home';
+    const nameTd = el('td', null, r.name || r.areaId);
+    if (isHomeArea(r)) nameTd.appendChild(el('span', 'home-pill', '⌂ home'));
+    tr.appendChild(nameTd);
     tr.appendChild(el('td', null, r.county || '—'));
     tr.appendChild(el('td', 'num', fmtInt(r.custOut)));
     tr.appendChild(el('td', 'num', fmtInt(r.nOut)));
@@ -457,12 +551,21 @@ function renderCurrent(rows) {
 async function refresh() {
   const win = Number($('#window').value);
   const basis = $('#basis').value;
-  const [status, acc, current, ts] = await Promise.all([
+  const [status, accAll, current, ts, home] = await Promise.all([
     data('status'),
     data('accuracy'),
     data('current'),
     data('timeseries'),
+    dataOrNull('home'),
   ]);
+
+  // Grading scope: township episodes (name identity) or individual outages
+  // (geometric continuity, clean lifecycles only). Older feeds lack the
+  // outage-level block — hide the selector then.
+  const scopeSel = $('#scope');
+  scopeSel.parentElement.style.display = accAll.outages ? '' : 'none';
+  const scope = accAll.outages && scopeSel.value === 'outages' ? 'outages' : 'townships';
+  const acc = scope === 'outages' ? accAll.outages : accAll;
 
   // Apply the selected on-time window + grading basis client-side.
   acc.onTimeWindowMin = win;
@@ -479,6 +582,7 @@ async function refresh() {
 
   renderLiveTiles(status);
   renderTimeseries(ts);
+  renderHome(home, current);
   renderAccuracy(acc, status, basis);
   renderCurrent(current);
 }
@@ -495,6 +599,7 @@ async function init() {
 
   $('#window').addEventListener('change', () => refresh().catch(console.error));
   $('#basis').addEventListener('change', () => refresh().catch(console.error));
+  $('#scope').addEventListener('change', () => refresh().catch(console.error));
   // "Collect now" works against the local dev server. On the static S3 deploy
   // there is no collect endpoint (a Lambda polls on a schedule), so the button
   // gracefully retires itself.

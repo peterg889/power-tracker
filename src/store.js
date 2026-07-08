@@ -19,6 +19,7 @@ const OUTPUT_FILES = {
   current: 'current.json',
   timeseries: 'timeseries.json',
   accuracy: 'accuracy.json',
+  home: 'home.json',
 };
 
 class FileStore {

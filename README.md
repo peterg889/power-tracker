@@ -65,6 +65,51 @@ histogram, a promised-lead-time-vs-error scatter, and a per-county breakdown.
 The same township can have many episodes over time (a new storm = a new
 episode), so re-outages never get confused with the original.
 
+### Individual outages: geometry, and why merges get excluded
+
+Beyond the township report, the map's geometry layer exposes each individual
+outage as a shape (a marker point, often an affected-area polygon) in public
+quadkey-addressed cluster tiles. Each poll, the collector walks that tile
+pyramid (~20–60 requests in calm weather) and tracks **outage-level episodes
+by geometric continuity**: an observation continues an episode when it sits
+within `MATCH_RADIUS_M` (default 150 m) of it, or when either one's polygon
+contains the other's point.
+
+The catch — and the reason a naive version of this would lie — is that these
+shapes carry **no stable identity** (`inc_id` is null) and visibly **merge,
+split, and reconcile** between polls. Treating a merge as "one outage ended"
+would fabricate on-time restorations wholesale. So the tracker is
+deliberately conservative:
+
+- a **clean lifecycle** (one shape ↔ one episode at every poll) is graded
+  exactly like a township episode, on both promise bases;
+- any episode touched by a **merge or split is tainted**: still tracked, but
+  excluded from grading and **counted visibly** on the dashboard — after a
+  reconcile you cannot honestly say which promise belonged to which
+  restoration;
+- outages still clustered together at max tile zoom keep nearby episodes
+  alive but taint them (their geometry is unresolvable that poll).
+
+The dashboard's **scope** selector switches the accuracy panel between
+township grading and clean-outage grading. Township numbers answer "is the
+promise on the public map honest for my town"; outage-level numbers answer
+"is each individual promise honest" — with the merge churn quantified instead
+of silently absorbed.
+
+### Home watch (optional GIS point test)
+
+Set `HOME_LAT` / `HOME_LON` (as CI secrets — never commit coordinates; the
+repo and dashboard are public) and every poll also tests whether any outage
+geometry covers that fixed point: polygon containment, or a marker within
+`HOME_RADIUS_M` (default 250 m). The dashboard then shows a home banner with
+live status, the promised restoration (outage-specific, or the township-wide
+estimate when the outage carries none), and a home-specific track record.
+
+A fixed point is immune to the merge problem by construction: the question
+"is this location covered right now" needs no outage identity, so home
+episodes are defined purely by coverage continuity. The published `home.json`
+carries status and distances only — not the location.
+
 Two guardrails keep the scorecard itself honest:
 
 - **Suspect snapshots are rejected.** If the feed's summary claims customers
@@ -214,6 +259,12 @@ All via environment variables (see `src/config.js`):
 | `S3_BUCKET` | — | If set, use S3 for the data feed instead of local files (enables the AWS path) |
 | `S3_STATE_BUCKET` | = `S3_BUCKET` | Private bucket for running state |
 | `MAX_GAP_MINUTES` | `3 × POLL_MINUTES` | Episodes resolved across a longer unobserved gap are excluded from grading |
+| `MATCH_RADIUS_M` | `150` | Outage observations within this distance across polls are the same episode |
+| `TERRITORY_BBOX` | JCP&L NJ | `minLat,minLon,maxLat,maxLon` for the geometry tile walk |
+| `HOME_LAT` / `HOME_LON` | — | Fixed point for the home watch (set as CI secrets, never committed) |
+| `HOME_RADIUS_M` | `250` | Marker within this distance of home counts as affecting it |
+| `HOME_LABEL` | `Home` | Dashboard label for the home banner |
+| `HOME_AREAS` | `MORRIS/MENDHAM TOWNSHIP` | Township fallback + row highlighting (`COUNTY/NAME`, comma-separated) |
 | `NO_SCHEDULER` | — | Set to `1` to disable the built-in poller |
 | `KUBRA_INSTANCE_ID` / `KUBRA_VIEW_ID` | JCP&L's | Point at another FirstEnergy operating company |
 | `UTILITY_NAME` / `SOURCE_URL` | JCP&L | UI labels |
@@ -233,7 +284,8 @@ The dashboard reads these static JSON documents (published locally under
 | `config.json` | Utility labels + poll interval |
 | `status.json` | Collection status + latest snapshot totals |
 | `current.json` | Currently-open outages |
-| `accuracy.json` | Aggregate accuracy on both bases (`final` / `first` stat blocks) + raw `errors` / `errorsFirst` arrays (the on-time window, grading basis, and histogram are applied in the browser) |
+| `accuracy.json` | Aggregate accuracy on both bases (`final` / `first` stat blocks) + raw `errors` / `errorsFirst` arrays, plus an `outages` block with the same shape for clean geometric lifecycles (window, basis, scope, and histogram are applied in the browser) |
+| `home.json` | Home-watch status: covered/clear, nearest-outage distance, current home outage details, home track record (no coordinates) |
 | `timeseries.json` | Customers-out over the collection window |
 
 The local dev server additionally exposes `POST /api/collect` to trigger a poll

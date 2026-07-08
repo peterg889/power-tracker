@@ -24,6 +24,9 @@
     </header>
 
     <main>
+      <!-- Home watch: GIS test of outage geometry against one fixed location -->
+      <section class="home-note" id="home-note" hidden></section>
+
       <!-- Live snapshot -->
       <section class="panel">
         <h2>Right now</h2>
@@ -42,6 +45,13 @@
         <div class="chart-head">
           <h2>ETR accuracy</h2>
           <span class="controls">
+            <label class="muted win">
+              scope
+              <select id="scope">
+                <option value="townships" selected>townships</option>
+                <option value="outages">individual outages</option>
+              </select>
+            </label>
             <label class="muted win">
               grading the
               <select id="basis">
