@@ -159,20 +159,50 @@ export function matchesHomeArea(name, county, patterns) {
 //   - outages still clustered at max tile zoom keep nearby episodes alive but
 //     taint them (their geometry is unresolvable that poll).
 
-const CLUSTER_KEEPALIVE_M = 1500;
+const CLUSTER_KEEPALIVE_M = 2500; // a z14 cluster centroid can sit >1 km from members
 const GEO_EVENT_CAP = 5000;
+const M_PER_DEG_LAT = 111195;
 
-function outageLinks(ep, o, matchRadiusM) {
-  const [elat, elon] = ep.point;
-  const [olat, olon] = o.point;
-  const dist = haversineM(elat, elon, olat, olon);
-  if (dist <= matchRadiusM) return dist;
-  for (const enc of o.geomA || []) {
-    if (pointInPolygon(elat, elon, decodePolyline(enc))) return 0;
+// Decode an item's rings once per poll; the O(n²) pair loop then only does
+// cheap tests (latitude prefilter, bbox before point-in-polygon).
+function prepGeom(point, geomA) {
+  const rings = (geomA || []).map(decodePolyline);
+  return {
+    lat: point[0],
+    lon: point[1],
+    rings,
+    bboxes: rings.map((ring) => {
+      let minLat = Infinity, minLon = Infinity, maxLat = -Infinity, maxLon = -Infinity;
+      for (const [la, lo] of ring) {
+        if (la < minLat) minLat = la;
+        if (la > maxLat) maxLat = la;
+        if (lo < minLon) minLon = lo;
+        if (lo > maxLon) maxLon = lo;
+      }
+      return [minLat, minLon, maxLat, maxLon];
+    }),
+  };
+}
+
+function ringsContain(g, lat, lon) {
+  for (let k = 0; k < g.rings.length; k++) {
+    const [a, b, c, d] = g.bboxes[k];
+    if (lat >= a && lat <= c && lon >= b && lon <= d && pointInPolygon(lat, lon, g.rings[k])) {
+      return true;
+    }
   }
-  for (const enc of ep.geomA || []) {
-    if (pointInPolygon(olat, olon, decodePolyline(enc))) return 0;
+  return false;
+}
+
+function outageLinks(a, b, matchRadiusM) {
+  // Latitude difference alone lower-bounds the distance — rejects almost
+  // every far pair before the trig.
+  if (Math.abs(a.lat - b.lat) * M_PER_DEG_LAT <= matchRadiusM) {
+    const d = haversineM(a.lat, a.lon, b.lat, b.lon);
+    if (d <= matchRadiusM) return d;
   }
+  if (ringsContain(b, a.lat, a.lon)) return 0;
+  if (ringsContain(a, b.lat, b.lon)) return 0;
   return null;
 }
 
@@ -183,12 +213,14 @@ export function applyOutageGeometries(state, geo, ts, { matchRadiusM = 150 } = {
   const { outages, clusterPoints = [] } = geo;
 
   // Build the bipartite continuity graph.
+  const epGeom = open.map((e) => prepGeom(e.point, e.geomA));
+  const outGeom = outages.map((o) => prepGeom(o.point, o.geomA));
   const edges = [];
   const epEdges = open.map(() => []);
   const outEdges = outages.map(() => []);
   for (let i = 0; i < open.length; i++) {
     for (let j = 0; j < outages.length; j++) {
-      const dist = outageLinks(open[i], outages[j], matchRadiusM);
+      const dist = outageLinks(epGeom[i], outGeom[j], matchRadiusM);
       if (dist != null) {
         const e = { i, j, dist };
         edges.push(e);
@@ -198,12 +230,13 @@ export function applyOutageGeometries(state, geo, ts, { matchRadiusM = 150 } = {
     }
   }
 
-  // Greedy nearest-first assignment decides who continues as whom. Merge and
-  // split are classified AFTER assignment, not from raw edge multiplicity:
-  // two distinct outages that simply sit within the radius of each other
-  // produce crossing edges every poll but still assign 1:1 — that is
-  // ambiguity, not a merge. A true merge is an absorption: an episode left
-  // with no continuation because every shape it links to was claimed.
+  // Who continues as whom: a greedy nearest-first seed (biases matches toward
+  // short edges), then Kuhn augmenting paths to reach MAXIMUM-cardinality
+  // matching. The augmentation step matters for honesty: greedy alone can
+  // strand an episode that a different pairing would have continued,
+  // fabricating a merge out of assignment order. After augmentation, an
+  // unmatched episode with edges is a real pigeonhole fact — that
+  // neighborhood provably has fewer shapes than episodes.
   edges.sort((a, b) => a.dist - b.dist);
   const epAssigned = new Map(); // ep index -> outage index it continued as
   const outAssigned = new Map(); // outage index -> ep index that continued as it
@@ -211,8 +244,24 @@ export function applyOutageGeometries(state, geo, ts, { matchRadiusM = 150 } = {
     if (epAssigned.has(e.i) || outAssigned.has(e.j)) continue;
     epAssigned.set(e.i, e.j);
     outAssigned.set(e.j, e.i);
-    observeOutage(open[e.i], outages[e.j], ts);
   }
+  const tryAugment = (i, visited) => {
+    for (const e of epEdges[i]) {
+      if (visited.has(e.j)) continue;
+      visited.add(e.j);
+      const holder = outAssigned.get(e.j);
+      if (holder == null || tryAugment(holder, visited)) {
+        epAssigned.set(i, e.j);
+        outAssigned.set(e.j, i);
+        return true;
+      }
+    }
+    return false;
+  };
+  for (let i = 0; i < open.length; i++) {
+    if (!epAssigned.has(i) && epEdges[i].length) tryAugment(i, new Set());
+  }
+  for (const [i, j] of epAssigned) observeOutage(open[i], outages[j], ts);
 
   // The feed publishes no lineage (inc_id is nulled, entry ids are positional
   // and reassigned every regeneration), so this synthesized event log is the
@@ -235,11 +284,17 @@ export function applyOutageGeometries(state, geo, ts, { matchRadiusM = 150 } = {
   let split = 0;
   let ambiguous = 0;
 
-  // Merges (absorptions): a linked episode with no continuation left. Group
-  // losers by the shape that absorbed them so one event names the whole merge.
+  // Merges (absorptions): after maximum matching, an unmatched-but-linked
+  // episode means its neighborhood provably has fewer shapes than episodes.
+  // Physically that is either a real merge OR a restoration right next to a
+  // surviving neighbor — indistinguishable without stable ids, which is
+  // exactly why these are excluded from grading rather than interpreted.
+  // Group losers by the shape that absorbed them so one event names the event.
+  const absorbedSet = new Set();
   const absorbedByOutage = new Map();
   for (let i = 0; i < open.length; i++) {
     if (epAssigned.has(i) || epEdges[i].length === 0) continue;
+    absorbedSet.add(i);
     const best = epEdges[i].reduce((a, b) => (a.dist <= b.dist ? a : b));
     if (!absorbedByOutage.has(best.j)) absorbedByOutage.set(best.j, []);
     absorbedByOutage.get(best.j).push(i);
@@ -310,16 +365,20 @@ export function applyOutageGeometries(state, geo, ts, { matchRadiusM = 150 } = {
     if (epAssigned.has(i)) continue;
     const ep = open[i];
     // Near an unresolvable max-zoom cluster: keep alive but taint — we can
-    // see "outages here", not which one this episode is.
-    const nearCluster = clusterPoints.some(
-      ([clat, clon]) => haversineM(ep.point[0], ep.point[1], clat, clon) <= CLUSTER_KEEPALIVE_M
-    );
-    if (nearCluster) {
-      ep.lastSeenTs = ts;
-      ep.samples++;
-      if (!ep.taint) ep.taint = 'clustered';
-      clustered++;
-      continue;
+    // see "outages here", not which one this episode is. Absorbed episodes
+    // are exempt: their lineage event already declared them ended, and an
+    // episode the ledger calls merged must not linger open.
+    if (!absorbedSet.has(i)) {
+      const nearCluster = clusterPoints.some(
+        ([clat, clon]) => haversineM(ep.point[0], ep.point[1], clat, clon) <= CLUSTER_KEEPALIVE_M
+      );
+      if (nearCluster) {
+        ep.lastSeenTs = ts;
+        ep.samples++;
+        if (!ep.taint) ep.taint = 'clustered';
+        clustered++;
+        continue;
+      }
     }
     ep.resolved = true;
     ep.resolvedTs = ts;
@@ -422,6 +481,9 @@ export function applyHomeImpact(state, impact, ts, areaEtr = null) {
   if (!impact || !impact.checked) return null;
   state.homeSeq ??= 0;
   state.homeEpisodes ??= [];
+  state.homeStats ??= { firstCheckTs: ts, checks: 0, covered: 0 };
+  state.homeStats.checks++;
+  if (impact.covered) state.homeStats.covered++;
   state.lastHomeCheck = {
     ts,
     covered: impact.covered,
@@ -481,32 +543,53 @@ export function applyHomeImpact(state, impact, ts, areaEtr = null) {
   return { covered: true, opened: !open };
 }
 
-// Home status + track record for the dashboard's home panel.
+// Home status + the dedicated history for the GIS-watched point: every home
+// episode ever tracked (graded or not, ongoing or resolved) with its full
+// promise trail, plus the monitoring ledger (how many checks, how many found
+// the point covered). Home episodes are rare, so the full history stays small.
 export function homeStatus(state, { maxGapMin = Infinity } = {}) {
   const eps = state.homeEpisodes || [];
   const open = eps.find((e) => !e.resolved) || null;
-  const graded = eps
-    .filter((e) => e.resolved && e.finalEtr != null)
+  const history = eps
     .map((e) => {
-      const actual = Math.round((e.lastSeenTs + e.resolvedTs) / 2);
+      const actual = e.resolved ? Math.round((e.lastSeenTs + e.resolvedTs) / 2) : null;
+      const gapMin = e.resolved ? Math.round((e.resolvedTs - e.lastSeenTs) / MIN) : null;
+      const graded = e.resolved && e.finalEtr != null && gapMin <= maxGapMin;
       return {
+        id: e.id,
         startTs: e.startTs,
         resolvedTs: e.resolvedTs,
-        durationMin: Math.round((actual - e.startTs) / MIN),
-        finalErrorMin: Math.round((actual - e.finalEtr) / MIN),
+        resolved: e.resolved,
+        durationMin: actual != null ? Math.round((actual - e.startTs) / MIN) : null,
+        peakCustA: e.peakCustA,
+        firstEtr: e.firstEtr,
+        finalEtr: e.finalEtr,
+        finalErrorMin: graded ? Math.round((actual - e.finalEtr) / MIN) : null,
         firstErrorMin:
-          e.firstEtr != null ? Math.round((actual - e.firstEtr) / MIN) : null,
-        gapMin: Math.round((e.resolvedTs - e.lastSeenTs) / MIN),
+          graded && e.firstEtr != null ? Math.round((actual - e.firstEtr) / MIN) : null,
         etrRevisions: e.etrRevisions,
         etrSource: e.etrSource,
-        peakCustA: e.peakCustA,
+        etrHistory: e.etrHistory || [],
+        kind: e.lastKind ?? null,
+        distM: e.lastDistM ?? null,
+        cause: e.lastCause ?? null,
+        gapMin,
+        graded,
       };
     })
-    .filter((e) => e.gapMin <= maxGapMin);
+    .sort((a, b) => b.startTs - a.startTs);
+  const graded = history.filter((e) => e.graded);
   const finals = graded.map((e) => e.finalErrorMin).sort((a, b) => a - b);
   return {
     enabled: Boolean(state.lastHomeCheck),
     lastCheck: state.lastHomeCheck ?? null,
+    monitoring: state.homeStats
+      ? {
+          since: state.homeStats.firstCheckTs,
+          checks: state.homeStats.checks,
+          coveredChecks: state.homeStats.covered,
+        }
+      : null,
     current: open
       ? {
           startTs: open.startTs,
@@ -524,7 +607,7 @@ export function homeStatus(state, { maxGapMin = Infinity } = {}) {
     episodes: eps.length,
     gradedCount: graded.length,
     medianFinalErrorMin: finals.length ? round1(quantile(finals, 0.5)) : null,
-    recent: graded.slice(-10).reverse(),
+    history,
   };
 }
 

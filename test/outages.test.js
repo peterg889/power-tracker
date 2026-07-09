@@ -163,6 +163,19 @@ test('home episodes: coverage continuity survives merge-like churn', () => {
   assert.equal(h.medianFinalErrorMin, -45);
   assert.equal(h.current, null);
 
+  // Dedicated history: the full episode record with its promise trail.
+  assert.equal(h.history.length, 1);
+  const rec = h.history[0];
+  assert.equal(rec.graded, true);
+  assert.equal(rec.finalErrorMin, -45);
+  assert.equal(rec.firstErrorMin, -75, 'first promise T0+120m vs actual T0+45m');
+  assert.equal(rec.etrRevisions, 1);
+  assert.equal(rec.etrHistory.length, 2, 'both promises preserved verbatim');
+  assert.equal(rec.peakCustA, 40);
+
+  // Monitoring ledger: 3 checks, covered during 2 of them.
+  assert.deepEqual(h.monitoring, { since: T0, checks: 3, coveredChecks: 2 });
+
   // ETR falls back to the township estimate when the outage has none.
   const s2 = createState();
   applyHomeImpact(

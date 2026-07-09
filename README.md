@@ -76,19 +76,30 @@ within `MATCH_RADIUS_M` (default 150 m) of it, or when either one's polygon
 contains the other's point.
 
 The catch — and the reason a naive version of this would lie — is that these
-shapes carry **no stable identity** (`inc_id` is null) and visibly **merge,
-split, and reconcile** between polls. Treating a merge as "one outage ended"
-would fabricate on-time restorations wholesale. So the tracker is
-deliberately conservative:
+shapes carry **no stable identity** (`inc_id` is null on every public entry;
+the visible ids are tile positions reassigned each regeneration) and visibly
+**merge, split, and reconcile** between polls. Treating a merge as "one
+outage ended" would fabricate on-time restorations wholesale. So the tracker
+is deliberately rigorous about what it claims:
 
+- continuation is decided by **maximum-cardinality matching** (a
+  nearest-first seed plus augmenting paths), so a reconcile is only declared
+  when a neighborhood **provably** has fewer or more shapes than episodes —
+  never because assignment order happened to strand someone;
 - a **clean lifecycle** (one shape ↔ one episode at every poll) is graded
   exactly like a township episode, on both promise bases;
-- any episode touched by a **merge or split is tainted**: still tracked, but
-  excluded from grading and **counted visibly** on the dashboard — after a
-  reconcile you cannot honestly say which promise belonged to which
-  restoration;
+- an **absorption** taints everyone involved and is logged to the lineage
+  ledger. Physically it is either a real merge or a restoration right next to
+  a surviving neighbor — indistinguishable without ids — which is exactly why
+  these are excluded from grading rather than interpreted;
+- two lifecycles that continue 1:1 but sit within matching range of each
+  other are tainted **ambiguous** (their identities could silently swap) —
+  excluded from grading, but no lineage event is fabricated;
 - outages still clustered together at max tile zoom keep nearby episodes
-  alive but taint them (their geometry is unresolvable that poll).
+  alive but taint them (their geometry is unresolvable that poll);
+- the feed publishes **no lineage record at all**, so the tracker synthesizes
+  one: every merge/split becomes a durable event (episode ids, surviving
+  successor, location) with running totals on the dashboard.
 
 The dashboard's **scope** selector switches the accuracy panel between
 township grading and clean-outage grading. Township numbers answer "is the
@@ -107,8 +118,11 @@ estimate when the outage carries none), and a home-specific track record.
 
 A fixed point is immune to the merge problem by construction: the question
 "is this location covered right now" needs no outage identity, so home
-episodes are defined purely by coverage continuity. The published `home.json`
-carries status and distances only — not the location.
+episodes are defined purely by coverage continuity. The dashboard keeps a
+**dedicated home history**: every home episode ever tracked (ongoing or
+resolved, graded or not) with its full promise trail, plus a monitoring
+ledger (checks performed, checks that found the point covered). The published
+`home.json` carries status, history, and distances only — not the location.
 
 Two guardrails keep the scorecard itself honest:
 

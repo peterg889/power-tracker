@@ -523,7 +523,53 @@ function renderHome(home, current) {
         `median final-promise error ${fmtError(home.medianFinalErrorMin)}`
     );
   }
+  if (home && home.monitoring) {
+    const m = home.monitoring;
+    twp.push(
+      `monitored since ${fmtClock(m.since)} · ${fmtInt(m.checks)} geometry checks, ` +
+        `home covered during ${fmtInt(m.coveredChecks)}`
+    );
+  }
   if (twp.length) box.appendChild(el('div', 'muted', twp.join(' · ')));
+
+  // Dedicated history: every home episode the GIS watch has ever tracked.
+  if (home && home.history && home.history.length) {
+    const wrap = el('div', 'table-wrap');
+    wrap.style.marginTop = '10px';
+    const t = document.createElement('table');
+    t.innerHTML =
+      '<thead><tr><th>Home outage</th><th class="num">Duration</th>' +
+      '<th class="num">Customers</th><th>Promised restoration</th>' +
+      '<th class="num">Outcome</th><th class="num">Revisions</th><th>Cause</th></tr></thead>';
+    const tb = document.createElement('tbody');
+    for (const h of home.history) {
+      const tr = document.createElement('tr');
+      tr.appendChild(el('td', null, fmtClock(h.startTs)));
+      tr.appendChild(el('td', 'num', h.resolved ? fmtDurMin(h.durationMin) : 'ongoing'));
+      tr.appendChild(el('td', 'num', fmtInt(h.peakCustA)));
+      tr.appendChild(
+        el(
+          'td',
+          null,
+          h.finalEtr
+            ? fmtClock(h.finalEtr) + (h.etrSource === 'area' ? ' (township-wide)' : '')
+            : 'none given'
+        )
+      );
+      let outcome;
+      if (!h.resolved) outcome = '—';
+      else if (h.graded) outcome = fmtError(h.finalErrorMin);
+      else if (h.finalEtr == null) outcome = 'no promise to grade';
+      else outcome = 'not graded (collection gap)';
+      tr.appendChild(el('td', 'num', outcome));
+      tr.appendChild(el('td', 'num', h.etrRevisions ? `×${h.etrRevisions}` : '0'));
+      tr.appendChild(el('td', null, h.cause || '—'));
+      tb.appendChild(tr);
+    }
+    t.appendChild(tb);
+    wrap.appendChild(t);
+    box.appendChild(wrap);
+  }
 }
 
 function renderCurrent(rows) {

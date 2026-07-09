@@ -307,6 +307,46 @@ test('co-located persistent outages are ambiguous, NOT merges (live-feed regress
   assert.equal(acc.reconciliations.ambiguous, 2);
 });
 
+test('maximum matching prevents merges fabricated by assignment order', () => {
+  // Episodes A (0 m) and B (140 m). Next poll: X (10 m) and Y (-100 m).
+  // Edges: A-X 10, A-Y 100, B-X 130 — and B cannot reach Y (240 m).
+  // Greedy alone: A grabs X, stranding B -> a fabricated merge + split.
+  // Augmentation flips A to Y so B continues as X: everyone matched.
+  const s = createState();
+  applyOutageGeometries(s, { outages: [out(LAT, LON), out(LAT + M(140), LON)] }, t(0));
+  const r = applyOutageGeometries(
+    s,
+    { outages: [out(LAT + M(10), LON), out(LAT - M(100), LON)] },
+    t(1)
+  );
+  assert.equal(r.continued, 2, 'both episodes continue — nobody is stranded');
+  assert.equal(r.merged, 0, 'no absorption fabricated by greedy order');
+  assert.equal(r.opened, 0);
+  assert.equal(s.geoStats.merges, 0);
+  assert.equal(s.geoEvents.length, 0, 'no lineage event without a real reconcile');
+  // The crossing edge (A-X unused) still marks the pair ambiguous — honest,
+  // because their identities could have swapped.
+  assert.equal(r.ambiguous, 2);
+});
+
+test('an absorbed episode resolves even when a cluster is nearby', () => {
+  const s = createState();
+  applyOutageGeometries(s, { outages: [out(LAT, LON), out(LAT + M(100), LON)] }, t(0));
+  // One shape remains between them AND a max-zoom cluster sits 300 m away:
+  // the absorbed episode must still close — the ledger declared it ended.
+  const r = applyOutageGeometries(
+    s,
+    { outages: [out(LAT + M(50), LON)], clusterPoints: [[LAT + M(300), LON]] },
+    t(1)
+  );
+  assert.equal(r.resolved, 1, 'the merge loser closes despite the cluster');
+  assert.equal(r.clustered, 0);
+  const loser = s.outageEpisodes.find((e) => e.resolved);
+  assert.equal(loser.taint, 'merged');
+  assert.equal(loser.resolvedTs, t(1));
+  assert.equal(s.geoStats.merges, 1);
+});
+
 test('a well-separated pair never picks up ambiguity taint', () => {
   const s = createState();
   const pair = () => [out(LAT, LON, t(4)), out(LAT + M(400), LON, t(4))];
