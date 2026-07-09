@@ -53,7 +53,14 @@ export async function collectOnce(store = makeStore()) {
   }
 
   await store.save(state);
-  const outputs = buildOutputs(state, { maxGapMin: config.maxGapMinutes });
+  const outputs = buildOutputs(state, {
+    maxGapMin: config.maxGapMinutes,
+    storm: {
+      onsetCustOut: config.stormOnsetCust,
+      clearCustOut: config.stormClearCust,
+      clearMs: config.stormClearHours * 3600000,
+    },
+  });
   outputs.config = { ...publicConfig(), generatedAt: snap.fetchedAt };
   await store.writeOutputs(outputs);
   return { snap, result, state, outputs };

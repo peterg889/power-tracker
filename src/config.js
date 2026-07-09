@@ -79,6 +79,13 @@ export const config = {
   // physical outage across polls. Used by the geometric (outage-level)
   // tracker; polygon containment also links observations.
   matchRadiusM: Number(process.env.MATCH_RADIUS_M || 150),
+
+  // Storm / incident detection over the system-wide customers-out curve: an
+  // event opens at onset and closes only after a sustained quiet stretch, so
+  // one storm's numbers can never bleed into the next.
+  stormOnsetCust: Number(process.env.STORM_ONSET_CUST || 15000),
+  stormClearCust: Number(process.env.STORM_CLEAR_CUST || 5000),
+  stormClearHours: Number(process.env.STORM_CLEAR_HOURS || 6),
 };
 
 // The subset of config exposed to the browser dashboard.

@@ -107,6 +107,23 @@ promise on the public map honest for my town"; outage-level numbers answer
 "is each individual promise honest" — with the merge churn quantified instead
 of silently absorbed.
 
+### Storms: the two views
+
+Accuracy questions come in two shapes: **"how honest has JCP&L been overall"**
+(the historical aggregate) and **"how is THIS event going"** (the storm that
+knocked your neighborhood out). Mixing them contaminates both — so the
+tracker segments **events** from the system-wide customers-out curve: a storm
+opens when customers-out crosses `STORM_ONSET_CUST` and closes only after
+staying below `STORM_CLEAR_CUST` for `STORM_CLEAR_HOURS` (sustained quiet —
+recovery dips don't end it, and the next storm starts its own record).
+
+The dashboard's **period** selector switches every accuracy view between
+*all time*, *each detected event*, and *last 48 h*. Every graded episode's
+scatter row carries its start timestamp, so period filtering happens in the
+browser over the same published data — per-event numbers are recomputed, not
+separately curated. An active event also gets a banner: when it began, its
+peak, and how far recovery has come.
+
 ### Home watch (optional GIS point test)
 
 Set `HOME_LAT` / `HOME_LON` (as CI secrets — never commit coordinates; the
@@ -289,6 +306,9 @@ All via environment variables (see `src/config.js`):
 | `HOME_RADIUS_M` | `250` | Marker within this distance of home counts as affecting it |
 | `HOME_LABEL` | `Home` | Dashboard label for the home banner |
 | `HOME_AREAS` | `MORRIS/MENDHAM TOWNSHIP` | Township fallback + row highlighting (`COUNTY/NAME`, comma-separated) |
+| `STORM_ONSET_CUST` | `15000` | Customers-out level that opens a storm event |
+| `STORM_CLEAR_CUST` | `5000` | Quiet level for closing an event |
+| `STORM_CLEAR_HOURS` | `6` | How long it must stay quiet before the event closes |
 | `NO_SCHEDULER` | — | Set to `1` to disable the built-in poller |
 | `KUBRA_INSTANCE_ID` / `KUBRA_VIEW_ID` | JCP&L's | Point at another FirstEnergy operating company |
 | `UTILITY_NAME` / `SOURCE_URL` | JCP&L | UI labels |
@@ -310,6 +330,7 @@ The dashboard reads these static JSON documents (published locally under
 | `current.json` | Currently-open outages |
 | `accuracy.json` | Aggregate accuracy on both bases (`final` / `first` stat blocks) + raw `errors` / `errorsFirst` arrays, plus an `outages` block with the same shape for clean geometric lifecycles (window, basis, scope, and histogram are applied in the browser) |
 | `home.json` | Home-watch status: covered/clear, nearest-outage distance, current home outage details, the full episode history with promise trails, and a per-poll coverage timeline (~3.5 days) — no coordinates |
+| `storms.json` | Detected storm events (start, peak, end) — the active one plus recent history |
 | `timeseries.json` | Customers-out over the collection window |
 
 The local dev server additionally exposes `POST /api/collect` to trigger a poll

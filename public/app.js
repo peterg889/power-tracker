@@ -47,6 +47,132 @@ function computeRates(errors, win) {
   return { onTimeRate: (n - late - early) / n, lateRate: late / n, earlyRate: early / n };
 }
 
+// ---------- period (storm/event) windowing ----------
+// Every graded episode's scatter row carries startTs, so any period — a
+// detected storm, the last 48 h — is a client-side filter plus recomputed
+// stats. One storm's numbers can never contaminate another's.
+
+function quantileSorted(sorted, q) {
+  if (!sorted.length) return null;
+  const pos = (sorted.length - 1) * q;
+  const base = Math.floor(pos);
+  const rest = pos - base;
+  return sorted[base + 1] !== undefined
+    ? sorted[base] + rest * (sorted[base + 1] - sorted[base])
+    : sorted[base];
+}
+function statsOf(errors) {
+  if (!errors.length) return { meanErrorMin: null, medianErrorMin: null, medianAbsErrorMin: null };
+  const sorted = [...errors].sort((a, b) => a - b);
+  const absSorted = errors.map(Math.abs).sort((a, b) => a - b);
+  const r1 = (x) => Math.round(x * 10) / 10;
+  return {
+    meanErrorMin: r1(errors.reduce((s, x) => s + x, 0) / errors.length),
+    medianErrorMin: r1(quantileSorted(sorted, 0.5)),
+    medianAbsErrorMin: r1(quantileSorted(absSorted, 0.5)),
+  };
+}
+
+function syncPeriodSelect(storms) {
+  const sel = $('#period');
+  const prev = sel.value;
+  const opts = [{ value: 'all', label: 'all time' }];
+  const recent = (storms?.recent || []).slice().reverse(); // newest first
+  for (const s of recent) {
+    opts.push({
+      value: `${s.startTs}:${s.endTs ?? ''}`,
+      label:
+        (s.endTs ? `event ${fmtClock(s.startTs)}` : `⛈ active event (began ${fmtClock(s.startTs)})`) +
+        ` · peak ${fmtInt(s.peakCustOut)} out`,
+    });
+  }
+  opts.push({ value: 'h48', label: 'last 48 h' });
+  sel.innerHTML = '';
+  for (const o of opts) {
+    const opt = document.createElement('option');
+    opt.value = o.value;
+    opt.textContent = o.label;
+    sel.appendChild(opt);
+  }
+  sel.value = [...sel.options].some((o) => o.value === prev) ? prev : 'all';
+}
+
+function periodRange(val) {
+  if (val === 'all') return null;
+  if (val === 'h48') return { start: Date.now() - 48 * 3600e3, end: Infinity };
+  const [s, e] = val.split(':');
+  return { start: Number(s), end: e ? Number(e) : Infinity };
+}
+
+// Recompute the accuracy view for a period from its scatter rows.
+function windowView(base, rows) {
+  const errors = rows.map((r) => r.errorMin);
+  const errorsFirst = rows.map((r) => r.firstErrorMin).filter((e) => e != null);
+  let byCounty = [];
+  if (base.byCounty && base.byCounty.length) {
+    const groups = new Map();
+    for (const r of rows) {
+      const k = r.county || 'Unknown';
+      if (!groups.has(k)) groups.set(k, []);
+      groups.get(k).push(r);
+    }
+    byCounty = [...groups.entries()]
+      .map(([county, g]) => {
+        const finals = g.map((r) => r.errorMin).sort((a, b) => a - b);
+        const firsts = g.map((r) => r.firstErrorMin).filter((e) => e != null).sort((a, b) => a - b);
+        const r1 = (x) => (x == null ? null : Math.round(x * 10) / 10);
+        return {
+          county,
+          count: g.length,
+          medianErrorMin: r1(quantileSorted(finals, 0.5)),
+          meanErrorMin: r1(finals.reduce((s, x) => s + x, 0) / finals.length),
+          medianFirstErrorMin: r1(quantileSorted(firsts, 0.5)),
+          meanFirstErrorMin: firsts.length ? r1(firsts.reduce((s, x) => s + x, 0) / firsts.length) : null,
+        };
+      })
+      .sort((a, b) => b.count - a.count);
+  }
+  return {
+    windowed: true,
+    gradedCount: rows.length,
+    onTimeWindowMin: base.onTimeWindowMin,
+    final: statsOf(errors),
+    first: statsOf(errorsFirst),
+    meanRevisions: rows.length
+      ? Math.round((rows.reduce((s, r) => s + (r.etrRevisions || 0), 0) / rows.length) * 10) / 10
+      : null,
+    totalCustomerEpisodes: rows.reduce((s, r) => s + (r.peakCustA || 0), 0),
+    byCounty,
+    scatter: rows,
+    errors,
+    errorsFirst,
+  };
+}
+
+function renderEvent(storms, status) {
+  const box = $('#event-note');
+  if (!storms || (!storms.active && !(storms.recent || []).length)) {
+    box.hidden = true;
+    return;
+  }
+  box.hidden = false;
+  if (storms.active) {
+    const a = storms.active;
+    const now = status.latest?.totalCustOut;
+    const pct =
+      a.peakCustOut && now != null
+        ? Math.max(0, Math.round((1 - now / a.peakCustOut) * 100))
+        : null;
+    box.textContent =
+      `⛈ Active event: began ${fmtClock(a.startTs)} · peaked ${fmtInt(a.peakCustOut)} customers out ` +
+      `${fmtRel(a.peakTs)}` +
+      (pct != null ? ` · ${pct}% recovered from peak` : '');
+  } else {
+    const s = storms.recent[storms.recent.length - 1];
+    box.textContent = `Last event: ${fmtClock(s.startTs)} → ${fmtClock(s.endTs)} · peak ${fmtInt(s.peakCustOut)} customers out`;
+  }
+}
+
 // Bucket signed error minutes for the distribution chart. Done client-side so
 // the grading-basis selector (first vs. final promise) works on static hosting.
 function buildHistogram(errors) {
@@ -231,6 +357,10 @@ function renderAccuracy(acc, status, basis) {
   const body = $('#accuracy-body');
   body.innerHTML = '';
 
+  if (!acc.gradedCount && acc.windowed) {
+    body.appendChild(el('div', 'empty', 'No graded outages in this period yet.'));
+    return;
+  }
   if (!acc.gradedCount) {
     const wrap = el('div', 'empty');
     wrap.appendChild(
@@ -537,8 +667,9 @@ function renderHome(home, current) {
   }
   if (home && home.gradedCount) {
     twp.push(
-      `track record here: ${fmtInt(home.gradedCount)} home outage${home.gradedCount > 1 ? 's' : ''} graded, ` +
-        `median final-promise error ${fmtError(home.medianFinalErrorMin)}`
+      `track record here: ${fmtInt(home.gradedCount)} home outage${home.gradedCount > 1 ? 's' : ''} graded — ` +
+        `vs first promise ${fmtError(home.medianFirstErrorMin)}, ` +
+        `vs final promise ${fmtError(home.medianFinalErrorMin)} (median)`
     );
   }
   if (home && home.monitoring) {
@@ -564,7 +695,8 @@ function renderHome(home, current) {
     t.innerHTML =
       '<thead><tr><th>Home outage</th><th class="num">Duration</th>' +
       '<th class="num">Customers</th><th>Promised restoration</th>' +
-      '<th class="num">Outcome</th><th class="num">Revisions</th><th>Cause</th></tr></thead>';
+      '<th class="num">vs first promise</th>' +
+      '<th class="num">vs final promise</th><th class="num">Revisions</th><th>Cause</th></tr></thead>';
     const tb = document.createElement('tbody');
     for (const h of home.history) {
       const tr = document.createElement('tr');
@@ -580,12 +712,14 @@ function renderHome(home, current) {
             : 'none given'
         )
       );
-      let outcome;
-      if (!h.resolved) outcome = '—';
-      else if (h.graded) outcome = fmtError(h.finalErrorMin);
-      else if (h.finalEtr == null) outcome = 'no promise to grade';
-      else outcome = 'not graded (collection gap)';
-      tr.appendChild(el('td', 'num', outcome));
+      let unGraded;
+      if (!h.resolved) unGraded = '—';
+      else if (h.finalEtr == null) unGraded = 'no promise to grade';
+      else if (!h.graded) unGraded = 'not graded (collection gap)';
+      tr.appendChild(
+        el('td', 'num', h.graded && h.firstErrorMin != null ? fmtError(h.firstErrorMin) : unGraded ?? '—')
+      );
+      tr.appendChild(el('td', 'num', h.graded ? fmtError(h.finalErrorMin) : unGraded ?? '—'));
       tr.appendChild(el('td', 'num', h.etrRevisions ? `×${h.etrRevisions}` : '0'));
       tr.appendChild(el('td', null, h.cause || '—'));
       tb.appendChild(tr);
@@ -602,16 +736,13 @@ function renderHome(home, current) {
       }
       if (h.etrSource === 'area') bits.push('promise is the township-wide estimate');
       if (h.flaps) bits.push(`bridged ${fmtInt(h.flaps)} feed coverage gap${h.flaps > 1 ? 's' : ''}`);
-      if (h.graded && h.firstErrorMin != null && h.etrRevisions > 0) {
-        bits.push(`graded on the first promise: ${fmtError(h.firstErrorMin)}`);
-      }
       if (h.resolved && !h.graded && h.finalEtr != null && h.gapMin != null) {
         bits.push(`observation gap ${fmtDurMin(h.gapMin)}`);
       }
       if (bits.length) {
         const sub = document.createElement('tr');
         const td = el('td', 'muted', bits.join(' · '));
-        td.colSpan = 7;
+        td.colSpan = 8;
         sub.appendChild(td);
         tb.appendChild(sub);
       }
@@ -697,12 +828,13 @@ function renderCurrent(rows) {
 async function refresh() {
   const win = Number($('#window').value);
   const basis = $('#basis').value;
-  const [status, accAll, current, ts, home] = await Promise.all([
+  const [status, accAll, current, ts, home, storms] = await Promise.all([
     data('status'),
     data('accuracy'),
     data('current'),
     data('timeseries'),
     dataOrNull('home'),
+    dataOrNull('storms'),
   ]);
 
   // Grading scope: township episodes (name identity) or individual outages
@@ -711,7 +843,19 @@ async function refresh() {
   const scopeSel = $('#scope');
   scopeSel.parentElement.style.display = accAll.outages ? '' : 'none';
   const scope = accAll.outages && scopeSel.value === 'outages' ? 'outages' : 'townships';
-  const acc = scope === 'outages' ? accAll.outages : accAll;
+  let acc = scope === 'outages' ? accAll.outages : accAll;
+
+  // Period: all time, a detected storm event, or the last 48 h.
+  syncPeriodSelect(storms);
+  const range = periodRange($('#period').value);
+  if (range) {
+    acc = windowView(
+      acc,
+      (acc.scatter || []).filter(
+        (p) => p.startTs != null && p.startTs >= range.start && p.startTs <= range.end
+      )
+    );
+  }
 
   // Apply the selected on-time window + grading basis client-side.
   acc.onTimeWindowMin = win;
@@ -727,6 +871,7 @@ async function refresh() {
   badge.classList.toggle('storm', (l.pageMode || '').toUpperCase() !== 'BLUESKY');
 
   renderLiveTiles(status);
+  renderEvent(storms, status);
   renderTimeseries(ts);
   renderHome(home, current);
   renderAccuracy(acc, status, basis);
@@ -746,6 +891,7 @@ async function init() {
   $('#window').addEventListener('change', () => refresh().catch(console.error));
   $('#basis').addEventListener('change', () => refresh().catch(console.error));
   $('#scope').addEventListener('change', () => refresh().catch(console.error));
+  $('#period').addEventListener('change', () => refresh().catch(console.error));
   // "Collect now" works against the local dev server. On the static S3 deploy
   // there is no collect endpoint (a Lambda polls on a schedule), so the button
   // gracefully retires itself.

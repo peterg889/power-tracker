@@ -441,6 +441,7 @@ export function outageAccuracy(state, { onTimeWindowMin = 60, maxGapMin = Infini
     .map((e) => {
       const actual = Math.round((e.lastSeenTs + e.resolvedTs) / 2);
       return {
+        startTs: e.startTs,
         finalErrorMin: Math.round((actual - e.finalEtr) / MIN),
         firstErrorMin:
           e.firstEtr != null ? Math.round((actual - e.firstEtr) / MIN) : null,
@@ -478,10 +479,12 @@ export function outageAccuracy(state, { onTimeWindowMin = 60, maxGapMin = Infini
     totalCustomerEpisodes: inGap.reduce((s, e) => s + (e.peakCustA || 0), 0),
     byCounty: [],
     scatter: inGap.map((e) => ({
+      startTs: e.startTs,
       promisedLeadMin: e.promisedLeadMin,
       errorMin: e.finalErrorMin,
       firstLeadMin: e.firstLeadMin,
       firstErrorMin: e.firstErrorMin,
+      etrRevisions: e.etrRevisions,
       peakCustA: e.peakCustA,
       name: e.cause,
       county: null,
@@ -551,7 +554,14 @@ export function applyHomeImpact(state, impact, ts, areaEtr = null) {
 
   const best =
     impact.matches.find((m) => m.kind === 'polygon') || impact.matches[0] || {};
-  const etr = best.etr ?? areaEtr ?? null;
+  // The home can sit inside several clusters at once, with different — or
+  // no — promises. The promise recorded for the house prefers, in order:
+  // the display-best covering shape's own ETR, any other covering shape's
+  // ETR (matches arrive polygon-first, nearest-first), and only then the
+  // township-wide estimate.
+  const promiseMatch =
+    best.etr != null ? best : impact.matches.find((m) => m.etr != null) || null;
+  const etr = promiseMatch?.etr ?? areaEtr ?? null;
   const custA = impact.matches.reduce((s, m) => s + (m.custA || 0), 0);
   pushCheck({ ts, c: 1, nm: impact.nearestM ?? null, cust: custA, etr });
 
@@ -589,7 +599,7 @@ export function applyHomeImpact(state, impact, ts, areaEtr = null) {
     if (ep.firstEtr == null) ep.firstEtr = etr;
     if (ep.finalEtr != null && etr !== ep.finalEtr) ep.etrRevisions++;
     ep.finalEtr = etr;
-    ep.etrSource = best.etr != null ? 'outage' : 'area';
+    ep.etrSource = promiseMatch ? 'outage' : 'area';
     const last = ep.etrHistory[ep.etrHistory.length - 1];
     if (!last || last.etr !== etr) ep.etrHistory.push({ ts, etr });
   }
@@ -672,6 +682,10 @@ export function homeStatus(state, { maxGapMin = Infinity, coalesceMin = 90 } = {
     .sort((a, b) => b.startTs - a.startTs);
   const graded = history.filter((e) => e.graded);
   const finals = graded.map((e) => e.finalErrorMin).sort((a, b) => a - b);
+  const firsts = graded
+    .map((e) => e.firstErrorMin)
+    .filter((e) => e != null)
+    .sort((a, b) => a - b);
   return {
     enabled: Boolean(state.lastHomeCheck),
     lastCheck: state.lastHomeCheck ?? null,
@@ -711,6 +725,9 @@ export function homeStatus(state, { maxGapMin = Infinity, coalesceMin = 90 } = {
     episodes: eps.length,
     gradedCount: graded.length,
     medianFinalErrorMin: finals.length ? round1(quantile(finals, 0.5)) : null,
+    // The question a household actually asks: when did power come back vs
+    // the FIRST estimate they were given.
+    medianFirstErrorMin: firsts.length ? round1(quantile(firsts, 0.5)) : null,
     history,
   };
 }
@@ -843,11 +860,16 @@ export function accuracySummary(state, { onTimeWindowMin = 60, maxGapMin = Infin
     meanRevisions: round1(eps.reduce((s, e) => s + e.etrRevisions, 0) / n),
     totalCustomerEpisodes: eps.reduce((s, e) => s + (e.peakCustA || 0), 0),
     byCounty: byCounty(eps),
+    // One row per graded episode, self-sufficient for client-side recomputes:
+    // startTs lets the browser window any period (a storm, last 48 h) without
+    // a separate server payload per period.
     scatter: eps.map((e) => ({
+      startTs: e.startTs,
       promisedLeadMin: e.promisedLeadMin,
       errorMin: e.finalErrorMin,
       firstLeadMin: e.firstLeadMin,
       firstErrorMin: e.firstErrorMin,
+      etrRevisions: e.etrRevisions,
       peakCustA: e.peakCustA,
       name: e.name,
       county: e.county,
@@ -881,6 +903,51 @@ function byCounty(eps) {
       };
     })
     .sort((a, b) => b.count - a.count);
+}
+
+// ---------------- storm / incident segmentation ----------------
+//
+// A household's outages cluster into EVENTS: a storm knocks a swath of homes
+// out around the same time, everyone is eventually restored, and the event is
+// over — the next storm must not contaminate its numbers. A storm is detected
+// from the system-wide customers-out curve: it opens when custOut crosses
+// onsetCustOut and closes only after custOut has stayed below clearCustOut
+// for clearMs (sustained quiet, so recovery dips don't end it prematurely).
+// endTs is the FIRST poll of the sustained-quiet run.
+export function detectStorms(
+  state,
+  { onsetCustOut = 15000, clearCustOut = 5000, clearMs = 6 * 3600000 } = {}
+) {
+  const storms = [];
+  let cur = null;
+  let clearSince = null;
+  for (const p of state.polls) {
+    const c = p.custOut ?? 0;
+    if (!cur) {
+      if (c >= onsetCustOut) {
+        cur = { startTs: p.fetchedAt, endTs: null, peakCustOut: c, peakTs: p.fetchedAt };
+        clearSince = null;
+      }
+    } else {
+      if (c > cur.peakCustOut) {
+        cur.peakCustOut = c;
+        cur.peakTs = p.fetchedAt;
+      }
+      if (c <= clearCustOut) {
+        clearSince ??= p.fetchedAt;
+        if (p.fetchedAt - clearSince >= clearMs) {
+          cur.endTs = clearSince;
+          storms.push(cur);
+          cur = null;
+          clearSince = null;
+        }
+      } else {
+        clearSince = null;
+      }
+    }
+  }
+  if (cur) storms.push(cur); // still active (endTs null)
+  return storms;
 }
 
 export function status(state) {
@@ -947,14 +1014,19 @@ export function timeseries(state, limit = 20000) {
 // same shapes. Accuracy is emitted window-independent (with raw `errors` /
 // `errorsFirst` arrays) so the client can recompute rates + the histogram for
 // any on-time window and either grading basis without a server round-trip.
-export function buildOutputs(state, { onTimeWindowMin = 60, maxGapMin = Infinity } = {}) {
+export function buildOutputs(state, { onTimeWindowMin = 60, maxGapMin = Infinity, storm = {} } = {}) {
   const acc = accuracySummary(state, { onTimeWindowMin, maxGapMin });
   const out = outageAccuracy(state, { onTimeWindowMin, maxGapMin });
+  const storms = detectStorms(state, storm);
   return {
     status: status(state),
     current: currentOutages(state),
     timeseries: timeseries(state),
     home: homeStatus(state, { maxGapMin }),
+    storms: {
+      active: storms.find((s) => !s.endTs) ?? null,
+      recent: storms.slice(-12),
+    },
     accuracy: {
       ...acc,
       errors: acc.scatter.map((s) => s.errorMin),

@@ -31,6 +31,7 @@
       <section class="panel">
         <h2>Right now</h2>
         <div class="tiles" id="live-tiles"></div>
+        <div id="event-note" class="muted" hidden></div>
         <div class="chart-wrap">
           <div class="chart-head">
             <h3>Customers out over the collection window</h3>
@@ -45,6 +46,12 @@
         <div class="chart-head">
           <h2>ETR accuracy</h2>
           <span class="controls">
+            <label class="muted win">
+              period
+              <select id="period">
+                <option value="all" selected>all time</option>
+              </select>
+            </label>
             <label class="muted win">
               scope
               <select id="scope">
