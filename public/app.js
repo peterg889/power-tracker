@@ -310,6 +310,22 @@ function renderAccuracy(acc, status, basis) {
   }
   body.appendChild(v);
 
+  // Outage scope: how often the utility's shapes reconciled (no public
+  // lineage exists — this log is synthesized by the tracker).
+  if (acc.reconciliations) {
+    const r = acc.reconciliations;
+    body.appendChild(
+      el(
+        'div',
+        'muted',
+        `Geometry reconciliations observed since tracking began: ` +
+          `${fmtInt(r.merges)} merges, ${fmtInt(r.splits)} splits, ` +
+          `${fmtInt(r.ambiguous)} co-located lifecycles too close to tell apart. ` +
+          `All are excluded from grading rather than guessed at.`
+      )
+    );
+  }
+
   // Charts split: histogram + scatter
   const split = el('div', 'split');
   const h1 = el('div', 'chart-wrap');

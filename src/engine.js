@@ -160,6 +160,7 @@ export function matchesHomeArea(name, county, patterns) {
 //     taint them (their geometry is unresolvable that poll).
 
 const CLUSTER_KEEPALIVE_M = 1500;
+const GEO_EVENT_CAP = 5000;
 
 function outageLinks(ep, o, matchRadiusM) {
   const [elat, elon] = ep.point;
@@ -197,36 +198,76 @@ export function applyOutageGeometries(state, geo, ts, { matchRadiusM = 150 } = {
     }
   }
 
-  // Multi-links are merges/splits: taint everyone involved.
-  let merged = 0;
-  let split = 0;
-  for (let j = 0; j < outages.length; j++) {
-    if (outEdges[j].length > 1) {
-      for (const e of outEdges[j]) {
-        if (!open[e.i].taint) merged++;
-        open[e.i].taint = open[e.i].taint || 'merged';
-      }
-    }
-  }
-  const splitEpisode = new Set();
-  for (let i = 0; i < open.length; i++) {
-    if (epEdges[i].length > 1) {
-      if (!open[i].taint) split++;
-      open[i].taint = open[i].taint || 'split';
-      splitEpisode.add(i);
-    }
-  }
-
-  // Greedy nearest-first assignment resolves who continues as whom.
+  // Greedy nearest-first assignment decides who continues as whom. Merge and
+  // split are classified AFTER assignment, not from raw edge multiplicity:
+  // two distinct outages that simply sit within the radius of each other
+  // produce crossing edges every poll but still assign 1:1 — that is
+  // ambiguity, not a merge. A true merge is an absorption: an episode left
+  // with no continuation because every shape it links to was claimed.
   edges.sort((a, b) => a.dist - b.dist);
-  const epAssigned = new Set();
-  const outAssigned = new Set();
+  const epAssigned = new Map(); // ep index -> outage index it continued as
+  const outAssigned = new Map(); // outage index -> ep index that continued as it
   for (const e of edges) {
     if (epAssigned.has(e.i) || outAssigned.has(e.j)) continue;
-    epAssigned.add(e.i);
-    outAssigned.add(e.j);
+    epAssigned.set(e.i, e.j);
+    outAssigned.set(e.j, e.i);
     observeOutage(open[e.i], outages[e.j], ts);
   }
+
+  // The feed publishes no lineage (inc_id is nulled, entry ids are positional
+  // and reassigned every regeneration), so this synthesized event log is the
+  // only durable record of how shapes merged and split.
+  state.geoStats ??= { merges: 0, splits: 0, ambiguous: 0 };
+  state.geoStats.ambiguous ??= 0;
+  state.geoEvents ??= [];
+  const logEvent = (ev) => {
+    state.geoEvents.push(ev);
+    if (state.geoEvents.length > GEO_EVENT_CAP) {
+      state.geoEvents.splice(0, state.geoEvents.length - GEO_EVENT_CAP);
+    }
+  };
+  const taint = (ep, kind) => {
+    if (ep.taint) return 0;
+    ep.taint = kind;
+    return 1;
+  };
+  let merged = 0;
+  let split = 0;
+  let ambiguous = 0;
+
+  // Merges (absorptions): a linked episode with no continuation left. Group
+  // losers by the shape that absorbed them so one event names the whole merge.
+  const absorbedByOutage = new Map();
+  for (let i = 0; i < open.length; i++) {
+    if (epAssigned.has(i) || epEdges[i].length === 0) continue;
+    const best = epEdges[i].reduce((a, b) => (a.dist <= b.dist ? a : b));
+    if (!absorbedByOutage.has(best.j)) absorbedByOutage.set(best.j, []);
+    absorbedByOutage.get(best.j).push(i);
+  }
+  for (const [j, loserIdxs] of absorbedByOutage) {
+    const survivor = outAssigned.has(j) ? open[outAssigned.get(j)] : null;
+    for (const i of loserIdxs) merged += taint(open[i], 'merged');
+    if (survivor) merged += taint(survivor, 'merged');
+    state.geoStats.merges++;
+    logEvent({
+      ts,
+      type: 'merge',
+      episodeIds: [...loserIdxs.map((i) => open[i].id), ...(survivor ? [survivor.id] : [])],
+      survivorId: survivor?.id ?? null,
+      at: outages[j].point,
+    });
+  }
+
+  // Crossing ambiguity: an unassigned edge whose both endpoints continued —
+  // two co-located lifecycles whose identities could silently swap. Tracked,
+  // excluded from grading, but no lineage event (nothing actually reconciled).
+  for (const e of edges) {
+    if (epAssigned.get(e.i) === e.j) continue; // this edge IS the assignment
+    if (!epAssigned.has(e.i) || !outAssigned.has(e.j)) continue; // merge/split territory
+    ambiguous += taint(open[e.i], 'ambiguous');
+    ambiguous += taint(open[outAssigned.get(e.j)], 'ambiguous');
+  }
+  state.geoStats.ambiguous += ambiguous;
 
   let opened = 0;
   let resolved = 0;
@@ -235,7 +276,7 @@ export function applyOutageGeometries(state, geo, ts, { matchRadiusM = 150 } = {
   for (let j = 0; j < outages.length; j++) {
     if (outAssigned.has(j)) continue;
     // Unassigned-but-linked outages are split children; standalone ones are new.
-    const child = outEdges[j].length > 0;
+    const parents = outEdges[j].map((e) => open[e.i].id);
     const o = outages[j];
     const ep = {
       id: ++state.outageSeq,
@@ -249,7 +290,7 @@ export function applyOutageGeometries(state, geo, ts, { matchRadiusM = 150 } = {
       firstEtr: null,
       finalEtr: null,
       etrRevisions: 0,
-      taint: child ? 'split' : null,
+      taint: parents.length ? 'split' : null,
       point: o.point,
       geomA: [],
       cause: null,
@@ -257,6 +298,12 @@ export function applyOutageGeometries(state, geo, ts, { matchRadiusM = 150 } = {
     observeOutage(ep, o, ts);
     state.outageEpisodes.push(ep);
     opened++;
+    if (parents.length) {
+      split++; // the child is born tainted
+      for (const e of outEdges[j]) split += taint(open[e.i], 'split');
+      state.geoStats.splits++;
+      logEvent({ ts, type: 'split-child', childId: ep.id, parentIds: parents, at: o.point });
+    }
   }
 
   for (let i = 0; i < open.length; i++) {
@@ -280,7 +327,7 @@ export function applyOutageGeometries(state, geo, ts, { matchRadiusM = 150 } = {
     resolved++;
   }
 
-  return { opened, continued: epAssigned.size, resolved, merged, split, clustered };
+  return { opened, continued: epAssigned.size, resolved, merged, split, clustered, ambiguous };
 }
 
 function observeOutage(ep, o, ts) {
@@ -332,6 +379,12 @@ export function outageAccuracy(state, { onTimeWindowMin = 60, maxGapMin = Infini
     taintedCount: tainted.length,
     noEtrCount: noEtr.length,
     excludedForGapCount: graded.length - inGap.length,
+    reconciliations: {
+      merges: state.geoStats?.merges ?? 0,
+      splits: state.geoStats?.splits ?? 0,
+      ambiguous: state.geoStats?.ambiguous ?? 0,
+      recent: (state.geoEvents ?? []).slice(-20),
+    },
     onTimeWindowMin,
     final: errorStats(finalErrors),
     first: errorStats(firstErrors),

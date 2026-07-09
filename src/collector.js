@@ -73,7 +73,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       if (g) {
         line +=
           ` | geo: tiles=${g.fetches} opened=${g.opened} continued=${g.continued} ` +
-          `resolved=${g.resolved} merged=${g.merged} split=${g.split} clustered=${g.clustered}`;
+          `resolved=${g.resolved} merged=${g.merged} split=${g.split} ` +
+          `ambiguous=${g.ambiguous} clustered=${g.clustered}`;
       }
       if (result.home) line += ` | home: ${result.home.covered ? 'OUT' : 'clear'}`;
       console.log(line);

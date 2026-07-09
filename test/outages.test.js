@@ -95,7 +95,7 @@ test('split taints the parent and marks children as split-born', () => {
     { outages: [out(40.7005, -74.5, T0 + 60 * MIN), out(40.6995, -74.5, T0 + 60 * MIN)] },
     T0 + step
   );
-  assert.equal(r.split, 1);
+  assert.equal(r.split, 2, 'parent and split child both newly tainted');
   assert.equal(r.opened, 1, 'second fragment becomes a new (tainted) episode');
   applyOutageGeometries(s, { outages: [] }, T0 + 2 * step);
   const acc = outageAccuracy(s);
