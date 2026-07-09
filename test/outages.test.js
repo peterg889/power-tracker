@@ -32,9 +32,14 @@ test('clean lifecycle: continuity within radius, revision tracking, grading', ()
   // Polls 1-2: same outage (moves 50 m), ETR revised down at poll 2.
   applyOutageGeometries(s, { outages: [out(40.7, -74.5, T0 + 120 * MIN)] }, T0);
   applyOutageGeometries(s, { outages: [out(40.7005, -74.5, T0 + 90 * MIN)] }, T0 + step);
-  // Poll 3: gone -> resolved. last seen T0+30m, gone T0+60m -> actual T0+45m.
+  // Poll 3: gone -> pending (flap grace); poll 4 confirms -> resolved, dated
+  // to the FIRST miss. last seen T0+30m, gone T0+60m -> actual T0+45m.
   const r3 = applyOutageGeometries(s, { outages: [] }, T0 + 2 * step);
-  assert.equal(r3.resolved, 1);
+  assert.equal(r3.resolved, 0);
+  assert.equal(r3.pending, 1);
+  const r4 = applyOutageGeometries(s, { outages: [] }, T0 + 3 * step);
+  assert.equal(r4.resolved, 1);
+  assert.equal(s.outageEpisodes[0].resolvedTs, T0 + 2 * step, 'dated to first miss');
 
   const acc = outageAccuracy(s);
   assert.equal(acc.gradedCount, 1);
@@ -52,8 +57,10 @@ test('distant observation is a different outage, not a continuation', () => {
   // 1.1 km north: outside the 150 m default radius.
   const r = applyOutageGeometries(s, { outages: [out(40.71, -74.5, null)] }, T0 + step);
   assert.equal(r.opened, 1);
-  assert.equal(r.resolved, 1);
+  assert.equal(r.pending, 1, 'the old episode goes pending, not resolved');
   assert.equal(r.continued, 0);
+  const r2 = applyOutageGeometries(s, { outages: [out(40.71, -74.5, null)] }, T0 + 2 * step);
+  assert.equal(r2.resolved, 1, 'second consecutive miss finalizes it');
 });
 
 test('merge taints every episode involved and excludes them from grading', () => {
@@ -81,6 +88,7 @@ test('merge taints every episode involved and excludes them from grading', () =>
   assert.equal(merged.merged, 2, 'both episodes tainted by the merge');
   // Resolve everything and check nothing got graded.
   applyOutageGeometries(s2, { outages: [] }, T0 + 2 * step);
+  applyOutageGeometries(s2, { outages: [] }, T0 + 3 * step);
   const acc = outageAccuracy(s2);
   assert.equal(acc.gradedCount, 0);
   assert.equal(acc.taintedCount, 2);
@@ -98,6 +106,7 @@ test('split taints the parent and marks children as split-born', () => {
   assert.equal(r.split, 2, 'parent and split child both newly tainted');
   assert.equal(r.opened, 1, 'second fragment becomes a new (tainted) episode');
   applyOutageGeometries(s, { outages: [] }, T0 + 2 * step);
+  applyOutageGeometries(s, { outages: [] }, T0 + 3 * step);
   const acc = outageAccuracy(s);
   assert.equal(acc.gradedCount, 0, 'no lifecycle stays clean through a split');
   assert.equal(acc.taintedCount, 2);
@@ -153,7 +162,11 @@ test('home episodes: coverage continuity survives merge-like churn', () => {
   applyHomeImpact(s, impactOut(T0 + 120 * MIN), T0);
   // Different shape covers home next poll (a merge happened) — same episode.
   applyHomeImpact(s, impactOut(T0 + 90 * MIN), T0 + step);
-  applyHomeImpact(s, impactClear, T0 + 2 * step);
+  // One clear poll = pending (flap grace); the second confirms and the
+  // resolution is dated to the first clear observation.
+  const pend = applyHomeImpact(s, impactClear, T0 + 2 * step);
+  assert.equal(pend.pending, true);
+  applyHomeImpact(s, impactClear, T0 + 3 * step);
 
   const h = homeStatus(s);
   assert.equal(h.enabled, true);
@@ -173,15 +186,41 @@ test('home episodes: coverage continuity survives merge-like churn', () => {
   assert.equal(rec.etrHistory.length, 2, 'both promises preserved verbatim');
   assert.equal(rec.peakCustA, 40);
 
-  // Monitoring ledger: 3 checks, covered during 2 of them.
-  assert.deepEqual(h.monitoring, { since: T0, checks: 3, coveredChecks: 2 });
+  // Monitoring ledger: 4 checks, covered during 2 of them.
+  assert.deepEqual(h.monitoring, { since: T0, checks: 4, coveredChecks: 2 });
 
-  // Per-poll audit trail: every check on record, including the clear one.
-  assert.equal(h.timeline.length, 3);
-  assert.deepEqual(h.timeline.map((r) => r.covered), [true, true, false]);
+  // Per-poll audit trail: every check on record, including the clear ones.
+  assert.equal(h.timeline.length, 4);
+  assert.deepEqual(h.timeline.map((r) => r.covered), [true, true, false, false]);
   assert.equal(h.timeline[0].custA, 40);
   assert.equal(h.timeline[0].etr, T0 + 120 * MIN);
   assert.equal(h.timeline[2].nearestM, 5000);
+
+  // Fragment coalescing: the exact production scenario — coverage flapped
+  // off across one sparse poll while the customer's power stayed out, so the
+  // raw records hold two episodes separated by a 63-minute clear span. They
+  // must present (and grade) as ONE continuous outage, gap on the record.
+  const sc = createState();
+  const HOUR = 60 * MIN;
+  applyHomeImpact(sc, impactOut(null), T0); // covered, no promise yet
+  applyHomeImpact(sc, impactClear, T0 + 1 * HOUR); // flap: one clear poll...
+  applyHomeImpact(sc, impactClear, T0 + 1.5 * HOUR); // ...confirmed -> fragment 1 closes
+  applyHomeImpact(sc, impactOut(T0 + 8 * HOUR), T0 + 2 * HOUR); // covered again + township promise
+  applyHomeImpact(sc, impactClear, T0 + 9 * HOUR);
+  applyHomeImpact(sc, impactClear, T0 + 9.5 * HOUR); // fragment 2 closes
+
+  const hc = homeStatus(sc, { coalesceMin: 90 });
+  assert.equal(sc.homeEpisodes.length, 2, 'raw records keep both fragments');
+  assert.equal(hc.episodes, 1, 'presented as one continuous outage');
+  const rec2 = hc.history[0];
+  assert.equal(rec2.startTs, T0, 'starts at the original onset');
+  assert.equal(rec2.resolvedTs, T0 + 9 * HOUR, 'ends at the final clear');
+  assert.equal(rec2.finalEtr, T0 + 8 * HOUR, 'promise carried from fragment 2');
+  assert.ok(rec2.flaps >= 1, 'the bridged clear span is visible');
+
+  // A genuinely separate later outage does NOT coalesce.
+  applyHomeImpact(sc, impactOut(null), T0 + 20 * HOUR);
+  assert.equal(homeStatus(sc, { coalesceMin: 90 }).episodes, 2);
 
   // ETR falls back to the township estimate when the outage has none.
   const s2 = createState();

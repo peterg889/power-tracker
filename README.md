@@ -174,14 +174,20 @@ Two supported paths, lightest first.
 
 ### Option 1 — GitHub only (recommended, $0, no cloud account)
 
-Everything runs inside GitHub: an Actions workflow polls the feed on a cron,
-the running state lives as commits on an orphan **`data` branch**, and the
-dashboard (plus its JSON feed) publishes to **GitHub Pages**:
+Everything runs inside GitHub: a **self-chaining long-runner** workflow polls
+the feed every 15 minutes (GitHub's cron proved unreliable at this cadence —
+observed gaps of 2.6–3.7 hours — so each ~5-hour job loops internally and
+dispatches its own successor, with a twice-hourly cron as a resurrection
+backstop). The running state AND the dashboard's JSON feed live as commits on
+an orphan **`data` branch**; the dashboard on **GitHub Pages** reads the feed
+straight from that branch via `raw.githubusercontent.com`, so app deploys and
+data updates are fully decoupled:
 
 ```
-GitHub Actions (cron, ~15 min) → collector
-        ├─ state.json  → committed to the `data` branch  (git history = audit log)
-        └─ data/*.json → public/ → GitHub Pages (the static dashboard)
+GitHub Actions long-runner (15-min loop, self-chaining) → collector
+        ├─ state.json  → `data` branch  (git history = tamper-evident audit log)
+        └─ data/*.json → `data` branch  → fetched by the dashboard at runtime
+GitHub Pages ← pages.yml (redeploys only when the app changes)
 ```
 
 Setup (one time):
@@ -199,11 +205,13 @@ verify the numbers weren't massaged after the fact. Failure alerting is free
 too: GitHub emails the workflow author when a scheduled run fails (including
 polls rejected by the suspect-snapshot guard).
 
-Caveats: GitHub cron is best-effort — runs can drift by minutes and are
-occasionally skipped under load. The tracker is built for that (real fetch
-timestamps, and the collection-gap exclusion keeps late polls from distorting
-grades). The `data` branch accrues ~96 small commits/day; if it ever bothers
-you, squash it — the dashboard only reads the latest state.
+Caveats: the tracker is built for imperfect scheduling anyway — real fetch
+timestamps, flap grace (a shape missing for one poll never closes an
+episode), and the collection-gap exclusion keep late or missed polls from
+distorting grades. The `data` branch accrues ~96 small commits/day; if it
+ever bothers you, squash it — the dashboard only reads the latest state. A
+long-runner does occupy one Actions runner most of the day, which is free on
+public repos.
 
 ### Option 2 — AWS serverless (S3 + Lambda + CloudFront)
 

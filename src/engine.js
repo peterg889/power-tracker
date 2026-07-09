@@ -162,6 +162,13 @@ export function matchesHomeArea(name, county, patterns) {
 const CLUSTER_KEEPALIVE_M = 2500; // a z14 cluster centroid can sit >1 km from members
 const GEO_EVENT_CAP = 5000;
 const M_PER_DEG_LAT = 111195;
+// The feed's shapes flap: a real, continuing outage can vanish from the
+// geometry for one regeneration and come back (observed in production while
+// a customer's power stayed out throughout). One missed poll therefore never
+// closes an episode — it goes pending, heals if the shape returns on the
+// next poll, and only finalizes after this many consecutive misses. The
+// resolution timestamp is always the FIRST miss, so timing math is unchanged.
+const CLOSE_AFTER_MISSES = 2;
 
 // Decode an item's rings once per poll; the O(n²) pair loop then only does
 // cheap tests (latitude prefilter, bbox before point-in-polygon).
@@ -361,35 +368,52 @@ export function applyOutageGeometries(state, geo, ts, { matchRadiusM = 150 } = {
     }
   }
 
+  let pending = 0;
   for (let i = 0; i < open.length; i++) {
     if (epAssigned.has(i)) continue;
     const ep = open[i];
-    // Near an unresolvable max-zoom cluster: keep alive but taint — we can
-    // see "outages here", not which one this episode is. Absorbed episodes
-    // are exempt: their lineage event already declared them ended, and an
-    // episode the ledger calls merged must not linger open.
+    // Absorbed episodes close immediately: their lineage event already
+    // declared them ended, and an episode the ledger calls merged must not
+    // linger open.
     if (!absorbedSet.has(i)) {
+      // Near an unresolvable max-zoom cluster: keep alive but taint — we can
+      // see "outages here", not which one this episode is.
       const nearCluster = clusterPoints.some(
         ([clat, clon]) => haversineM(ep.point[0], ep.point[1], clat, clon) <= CLUSTER_KEEPALIVE_M
       );
       if (nearCluster) {
         ep.lastSeenTs = ts;
         ep.samples++;
+        ep.missPolls = 0;
+        ep.missedSinceTs = null;
         if (!ep.taint) ep.taint = 'clustered';
         clustered++;
         continue;
       }
+      // Flap grace: a shape missing for a single poll stays pending and can
+      // heal (see observeOutage); only consecutive misses finalize.
+      ep.missPolls = (ep.missPolls || 0) + 1;
+      ep.missedSinceTs ??= ts;
+      if (ep.missPolls < CLOSE_AFTER_MISSES) {
+        pending++;
+        continue;
+      }
     }
     ep.resolved = true;
-    ep.resolvedTs = ts;
+    ep.resolvedTs = absorbedSet.has(i) ? ts : ep.missedSinceTs;
     ep.geomA = []; // matching geometry is dead weight once resolved
     resolved++;
   }
 
-  return { opened, continued: epAssigned.size, resolved, merged, split, clustered, ambiguous };
+  return { opened, continued: epAssigned.size, resolved, pending, merged, split, clustered, ambiguous };
 }
 
 function observeOutage(ep, o, ts) {
+  if (ep.missPolls) {
+    ep.flaps = (ep.flaps || 0) + 1; // the shape vanished and came back
+    ep.missPolls = 0;
+    ep.missedSinceTs = null;
+  }
   ep.lastSeenTs = ts;
   ep.samples++;
   ep.peakCustA = Math.max(ep.peakCustA, o.custA || 0);
@@ -509,10 +533,20 @@ export function applyHomeImpact(state, impact, ts, areaEtr = null) {
   if (!impact.covered) {
     pushCheck({ ts, c: 0, nm: impact.nearestM ?? null });
     if (open) {
-      open.resolved = true;
-      open.resolvedTs = ts;
+      // Same flap grace as outage episodes: one clear poll goes pending
+      // (observed in production: coverage flapped off while the customer's
+      // power stayed out); consecutive clear polls finalize, dated to the
+      // FIRST clear observation.
+      open.missPolls = (open.missPolls || 0) + 1;
+      open.missedSinceTs ??= ts;
+      if (open.missPolls >= CLOSE_AFTER_MISSES) {
+        open.resolved = true;
+        open.resolvedTs = open.missedSinceTs;
+        return { covered: false, resolved: true };
+      }
+      return { covered: false, resolved: false, pending: true };
     }
-    return { covered: false, resolved: Boolean(open) };
+    return { covered: false, resolved: false };
   }
 
   const best =
@@ -539,6 +573,11 @@ export function applyHomeImpact(state, impact, ts, areaEtr = null) {
     };
     state.homeEpisodes.push(ep);
   }
+  if (ep.missPolls) {
+    ep.flaps = (ep.flaps || 0) + 1; // coverage flapped off and back
+    ep.missPolls = 0;
+    ep.missedSinceTs = null;
+  }
   ep.lastSeenTs = ts;
   ep.samples++;
   ep.peakCustA = Math.max(ep.peakCustA, custA);
@@ -561,8 +600,46 @@ export function applyHomeImpact(state, impact, ts, areaEtr = null) {
 // episode ever tracked (graded or not, ongoing or resolved) with its full
 // promise trail, plus the monitoring ledger (how many checks, how many found
 // the point covered). Home episodes are rare, so the full history stays small.
-export function homeStatus(state, { maxGapMin = Infinity } = {}) {
-  const eps = state.homeEpisodes || [];
+//
+// Fragments are coalesced before anything else: the feed's shapes can flap
+// off for a poll (or one sparse poll during a scheduler outage) while the
+// customer's power stays out — verified against a real continuous outage that
+// the raw records split in two. Fragments whose clear span is under
+// coalesceMin are presented and graded as one continuous episode, with the
+// bridged gap counted in `flaps` so the healing itself stays visible.
+export function homeStatus(state, { maxGapMin = Infinity, coalesceMin = 90 } = {}) {
+  const raw = [...(state.homeEpisodes || [])].sort((a, b) => a.startTs - b.startTs);
+  const eps = [];
+  for (const e of raw) {
+    const prev = eps[eps.length - 1];
+    if (prev && prev.resolved && e.startTs - prev.resolvedTs <= coalesceMin * 60000) {
+      eps[eps.length - 1] = {
+        ...prev,
+        resolved: e.resolved,
+        resolvedTs: e.resolvedTs,
+        lastSeenTs: e.lastSeenTs,
+        samples: prev.samples + e.samples,
+        peakCustA: Math.max(prev.peakCustA, e.peakCustA),
+        firstEtr: prev.firstEtr ?? e.firstEtr,
+        finalEtr: e.finalEtr ?? prev.finalEtr,
+        etrSource: e.etrSource ?? prev.etrSource,
+        etrRevisions:
+          prev.etrRevisions +
+          e.etrRevisions +
+          (prev.finalEtr != null && e.firstEtr != null && prev.finalEtr !== e.firstEtr ? 1 : 0),
+        etrHistory: [...(prev.etrHistory || []), ...(e.etrHistory || [])],
+        flaps: (prev.flaps || 0) + (e.flaps || 0) + 1,
+        lastKind: e.lastKind ?? prev.lastKind,
+        lastDistM: e.lastDistM ?? prev.lastDistM,
+        lastCause: e.lastCause ?? prev.lastCause,
+        lastCrewStatus: e.lastCrewStatus ?? prev.lastCrewStatus,
+        missPolls: e.missPolls,
+        missedSinceTs: e.missedSinceTs,
+      };
+    } else {
+      eps.push({ ...e });
+    }
+  }
   const open = eps.find((e) => !e.resolved) || null;
   const history = eps
     .map((e) => {
@@ -587,6 +664,7 @@ export function homeStatus(state, { maxGapMin = Infinity } = {}) {
         kind: e.lastKind ?? null,
         distM: e.lastDistM ?? null,
         cause: e.lastCause ?? null,
+        flaps: e.flaps || 0,
         gapMin,
         graded,
       };
@@ -625,6 +703,9 @@ export function homeStatus(state, { maxGapMin = Infinity } = {}) {
           distM: open.lastDistM,
           cause: open.lastCause,
           crewStatus: open.lastCrewStatus,
+          flaps: open.flaps || 0,
+          // Set while coverage has flapped off but not yet confirmed clear.
+          pendingClearSince: open.missedSinceTs ?? null,
         }
       : null,
     episodes: eps.length,

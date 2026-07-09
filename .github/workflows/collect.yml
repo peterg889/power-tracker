@@ -1,45 +1,44 @@
-# The zero-infrastructure deploy: GitHub Actions polls the outage feed on a
-# cron, the running state lives as commits on an orphan `data` branch (every
-# poll is a timestamped commit — a public, tamper-evident audit log of the
-# collected data), and the dashboard + its JSON feed publish to GitHub Pages.
+# The zero-infrastructure deploy, hardened against GitHub cron throttling.
 #
-# One-time setup: repo Settings → Pages → Source: "GitHub Actions".
+# GitHub's `schedule` events proved wildly unreliable for a 15-minute cadence
+# (observed overnight: polls 2.6-3.7 HOURS apart), so this workflow is a
+# LONG-RUNNER: one job loops collect-and-publish every 15 minutes for ~5.3
+# hours, then dispatches its own successor (workflow_dispatch via
+# GITHUB_TOKEN is a documented exception to the no-recursion rule). The cron
+# below is only a resurrection backstop for the rare hard runner death —
+# the concurrency group keeps at most one runner plus one queued successor.
+#
+# Each iteration commits BOTH the running state and the dashboard's data
+# feed to the orphan `data` branch (a public, tamper-evident audit log); the
+# dashboard reads the feed from raw.githubusercontent.com, so no Pages
+# deployment is needed per poll (pages.yml redeploys the app on push).
 #
 # Notes:
-#  - GitHub cron is best-effort (runs can drift by minutes or occasionally be
-#    skipped). That's fine here: the collector stamps real fetch times, and
-#    episodes resolved across an oversized gap are excluded from grading.
-#  - The per-poll commits on the data branch count as repository activity, so
-#    the 60-day scheduled-workflow auto-disable never triggers while the
-#    collector is healthy.
-#  - A failing run (feed down, suspect snapshot rejected) emails the workflow
-#    author — that's the alerting story, no extra service needed.
+#  - A failing poll (feed down, suspect snapshot rejected) logs and retries
+#    at the next tick; episode models treat missed polls with flap grace.
+#  - Poll commits count as repository activity, so the 60-day scheduled-
+#    workflow auto-disable never triggers while collection is healthy.
 
 name: collect
 
 on:
   schedule:
-    # Every 15 min, offset from :00 to dodge GitHub's top-of-hour congestion.
-    - cron: '7,22,37,52 * * * *'
+    - cron: '11,41 * * * *' # backstop only — the loop below is the cadence
   workflow_dispatch: {}
 
-# Collection is a read-modify-write on state — never run two at once.
+# One collector at a time; a fired backstop/successor waits in the queue.
 concurrency:
   group: collect
   cancel-in-progress: false
 
 permissions:
   contents: write # push poll commits to the data branch
-  pages: write # publish the dashboard
-  id-token: write # required by deploy-pages
+  actions: write # dispatch the successor run
 
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+    timeout-minutes: 350 # < the 6 h job hard limit
     steps:
       - uses: actions/checkout@v4
 
@@ -76,27 +75,33 @@ jobs:
       # HOME_LAT/HOME_LON are repo secrets: the home-watch coordinates stay
       # out of the public repo; the published home.json carries only
       # covered/clear status and distances.
-      - name: Collect one snapshot
+      - name: Collect every 15 minutes for ~5.3 hours
         env:
           STATE_PATH: ${{ github.workspace }}/.state/state.json
           HOME_LAT: ${{ secrets.HOME_LAT }}
           HOME_LON: ${{ secrets.HOME_LON }}
-        run: node src/collector.js
-
-      - name: Commit state to the data branch
         run: |
-          cd .state
-          git add state.json
-          git commit -m "poll $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || { echo 'state unchanged'; exit 0; }
-          git push origin data
+          END=$(( SECONDS + 320*60 ))
+          while true; do
+            if node src/collector.js; then
+              mkdir -p .state/data
+              cp public/data/*.json .state/data/
+              (
+                cd .state
+                git add -A
+                git commit -q -m "poll $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || echo 'state unchanged'
+                git push -q origin data || { git pull --rebase -q origin data && git push -q origin data; }
+              ) || echo '::warning::state push failed; retrying next tick'
+            else
+              echo '::warning::poll failed; retrying next tick'
+            fi
+            [ $SECONDS -ge $END ] && break
+            sleep 900
+          done
 
-      # The file store wrote the refreshed data/*.json into public/, so the
-      # site artifact is simply the public directory.
-      - name: Upload site
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: public
-
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+      # Chain the successor so the 15-minute cadence never depends on cron.
+      - name: Dispatch successor run
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run collect --ref main || echo '::warning::successor dispatch failed; cron backstop will recover'

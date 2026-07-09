@@ -11,9 +11,19 @@ async function getJSON(url) {
   return r.json();
 }
 
-// Dashboard data is published as static JSON (by the local server or, in
-// production, by the S3-writing Lambda). Cache-bust so refreshes see new polls.
-const data = (name) => getJSON(`data/${name}.json?t=${Date.now()}`);
+// Dashboard data is published as static JSON. On GitHub Pages the live feed
+// comes from the repo's `data` branch (committed by the collector every
+// poll) via raw.githubusercontent.com — no Pages deploy per poll needed.
+// Everywhere else (local dev server, S3/CloudFront) it is served relative.
+// Cache-bust so refreshes see new polls.
+const DATA_BASE = (() => {
+  const m = location.hostname.match(/^([^.]+)\.github\.io$/);
+  if (!m) return 'data/';
+  const repo = location.pathname.split('/').filter(Boolean)[0];
+  if (!repo) return 'data/';
+  return `https://raw.githubusercontent.com/${m[1]}/${repo}/data/data/`;
+})();
+const data = (name) => getJSON(`${DATA_BASE}${name}.json?t=${Date.now()}`);
 // Tolerate documents that older deploys never published.
 const dataOrNull = (name) => data(name).catch(() => null);
 
@@ -480,7 +490,9 @@ function renderHome(home, current) {
     if (c.etr) {
       bits.push(
         `promised restoration ${fmtClock(c.etr)} (${
-          c.etrSource === 'area' ? 'township-wide estimate' : 'outage-specific'
+          c.etrSource === 'area'
+            ? 'township-wide estimate — none published for this outage specifically'
+            : 'outage-specific'
         }${c.etrRevisions ? `, revised ×${c.etrRevisions}` : ''})`
       );
     } else {
@@ -488,6 +500,12 @@ function renderHome(home, current) {
     }
     if (c.cause) bits.push(`cause: ${c.cause}`);
     if (c.crewStatus) bits.push(`crew: ${c.crewStatus}`);
+    if (c.flaps) bits.push(`feed coverage flapped ×${c.flaps} during this outage`);
+    if (c.pendingClearSince) {
+      bits.push(
+        `feed shows clear since ${fmtClock(c.pendingClearSince)} — awaiting a confirming poll`
+      );
+    }
     box.appendChild(el('div', null, bits.join(' · ')));
   } else if (geo) {
     box.className = 'home-note ok';
@@ -582,6 +600,8 @@ function renderHome(home, current) {
           'promise trail: ' + h.etrHistory.map((x) => fmtClock(x.etr)).join(' → ')
         );
       }
+      if (h.etrSource === 'area') bits.push('promise is the township-wide estimate');
+      if (h.flaps) bits.push(`bridged ${fmtInt(h.flaps)} feed coverage gap${h.flaps > 1 ? 's' : ''}`);
       if (h.graded && h.firstErrorMin != null && h.etrRevisions > 0) {
         bits.push(`graded on the first promise: ${fmtError(h.firstErrorMin)}`);
       }

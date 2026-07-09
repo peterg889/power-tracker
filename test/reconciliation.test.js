@@ -108,6 +108,7 @@ test('three-way merge: all tainted, one survivor continues, losers resolve at me
 
   // Nothing from a merge is ever graded, even with ETRs on record.
   applyOutageGeometries(s, { outages: [] }, t(2));
+  applyOutageGeometries(s, { outages: [] }, t(3));
   const acc = outageAccuracy(s);
   assert.equal(acc.gradedCount, 0);
   assert.equal(acc.taintedCount, 3);
@@ -189,6 +190,7 @@ test('split into three: parent tainted, two split-children born tainted, lineage
 
   // Resolve everything: no fragment lifecycle is gradable.
   applyOutageGeometries(s, { outages: [] }, t(2));
+  applyOutageGeometries(s, { outages: [] }, t(3));
   const acc = outageAccuracy(s);
   assert.equal(acc.gradedCount, 0);
   assert.equal(acc.taintedCount, 3);
@@ -223,7 +225,8 @@ test('split then re-merge: episodes stay tainted, lineage shows both events', ()
     t(1)
   ); // split
   applyOutageGeometries(s, { outages: [out(LAT, LON)] }, t(2)); // re-merge
-  applyOutageGeometries(s, { outages: [] }, t(3)); // all clear
+  applyOutageGeometries(s, { outages: [] }, t(3)); // all clear (pending)
+  applyOutageGeometries(s, { outages: [] }, t(4)); // confirmed
 
   assert.equal(s.geoStats.splits, 1);
   assert.equal(s.geoStats.merges, 1);
@@ -269,7 +272,8 @@ test('taint is local: a clean lifecycle in the same polls still grades', () => {
     { outages: [out(LAT + M(60), LON, t(4)), out(FAR, LON, t(2))] },
     t(1)
   ); // merge happens near LAT; FAR continues cleanly
-  applyOutageGeometries(s, { outages: [] }, t(2)); // everything restored
+  applyOutageGeometries(s, { outages: [] }, t(2)); // everything restored (pending)
+  applyOutageGeometries(s, { outages: [] }, t(3)); // confirmed
 
   const acc = outageAccuracy(s);
   assert.equal(acc.gradedCount, 1, 'only the clean lifecycle grades');
@@ -301,6 +305,7 @@ test('co-located persistent outages are ambiguous, NOT merges (live-feed regress
 
   // Excluded from grading like every other taint.
   applyOutageGeometries(s, { outages: [] }, t(3));
+  applyOutageGeometries(s, { outages: [] }, t(4));
   const acc = outageAccuracy(s);
   assert.equal(acc.gradedCount, 0);
   assert.equal(acc.taintedCount, 2);
@@ -353,6 +358,7 @@ test('a well-separated pair never picks up ambiguity taint', () => {
   applyOutageGeometries(s, { outages: pair() }, t(0));
   applyOutageGeometries(s, { outages: pair() }, t(1));
   applyOutageGeometries(s, { outages: [] }, t(2));
+  applyOutageGeometries(s, { outages: [] }, t(3));
   const acc = outageAccuracy(s);
   assert.equal(acc.gradedCount, 2, 'both clean lifecycles grade');
   assert.equal(acc.taintedCount, 0);
@@ -372,7 +378,9 @@ test('boundary: 140 m links as the same outage, 165 m does not', () => {
   const rFar = applyOutageGeometries(far, { outages: [out(LAT + M(165), LON)] }, t(1));
   assert.equal(rFar.continued, 0);
   assert.equal(rFar.opened, 1);
-  assert.equal(rFar.resolved, 1);
+  assert.equal(rFar.pending, 1, 'old episode pending under flap grace');
+  const rFar2 = applyOutageGeometries(far, { outages: [out(LAT + M(165), LON)] }, t(2));
+  assert.equal(rFar2.resolved, 1);
 });
 
 test('slow drift stays one clean episode even after moving far in total', () => {
@@ -384,6 +392,7 @@ test('slow drift stays one clean episode even after moving far in total', () => 
   assert.equal(s.outageEpisodes[0].taint, null);
   assert.equal(s.outageEpisodes[0].samples, 6);
   applyOutageGeometries(s, { outages: [] }, t(6));
+  applyOutageGeometries(s, { outages: [] }, t(7));
   assert.equal(outageAccuracy(s).gradedCount, 1);
 });
 
@@ -405,15 +414,41 @@ test('cluster keepalive bridges a clustered poll, then the episode resolves norm
   assert.equal(s.outageEpisodes[0].taint, 'clustered', 'the blind poll leaves a mark');
   // ...and because it was blind once, it is excluded from grading.
   applyOutageGeometries(s, { outages: [] }, t(3));
+  applyOutageGeometries(s, { outages: [] }, t(4));
   const acc = outageAccuracy(s);
   assert.equal(acc.gradedCount, 0);
   assert.equal(acc.taintedCount, 1);
 });
 
+test('a one-poll shape flap heals: same episode, no resolution, flap counted', () => {
+  // Observed in production: a customer's power stayed out continuously while
+  // the feed's geometry for their outage vanished for a poll and came back.
+  const s = createState();
+  applyOutageGeometries(s, { outages: [out(LAT, LON, t(9))] }, t(0));
+  const gone = applyOutageGeometries(s, { outages: [] }, t(1));
+  assert.equal(gone.pending, 1);
+  assert.equal(gone.resolved, 0);
+  const back = applyOutageGeometries(s, { outages: [out(LAT, LON, t(9))] }, t(2));
+  assert.equal(back.continued, 1);
+  assert.equal(back.opened, 0);
+
+  const ep = s.outageEpisodes[0];
+  assert.equal(s.outageEpisodes.length, 1, 'one lifecycle throughout');
+  assert.equal(ep.resolved, false);
+  assert.equal(ep.flaps, 1, 'the bridged gap is on the record');
+  assert.equal(ep.taint, null, 'a flap is feed noise, not a reconcile');
+
+  // It remains gradable once genuinely resolved.
+  applyOutageGeometries(s, { outages: [] }, t(3));
+  applyOutageGeometries(s, { outages: [] }, t(4));
+  assert.equal(outageAccuracy(s).gradedCount, 1);
+});
+
 test('re-outage at the same location is a new episode, not a resurrection', () => {
   const s = createState();
   applyOutageGeometries(s, { outages: [out(LAT, LON, t(1))] }, t(0));
-  applyOutageGeometries(s, { outages: [] }, t(1)); // resolves
+  applyOutageGeometries(s, { outages: [] }, t(1)); // pending
+  applyOutageGeometries(s, { outages: [] }, t(2)); // resolved (dated t1)
   applyOutageGeometries(s, { outages: [out(LAT, LON, t(6))] }, t(4)); // same spot, hours later
   assert.equal(s.outageEpisodes.length, 2);
   assert.equal(s.outageEpisodes[0].resolved, true);
@@ -432,6 +467,7 @@ test('gap exclusion and no-ETR accounting apply at the outage level too', () => 
   );
   // Collector goes dark for 6 h; both are gone when polling resumes.
   applyOutageGeometries(s, { outages: [] }, t(12));
+  applyOutageGeometries(s, { outages: [] }, t(13));
   const strict = outageAccuracy(s, { maxGapMin: 45 });
   assert.equal(strict.gradedCount, 0);
   assert.equal(strict.excludedForGapCount, 1, 'the promised one is gap-excluded');
