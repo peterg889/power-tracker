@@ -532,6 +532,12 @@ function renderHome(home, current) {
   }
   if (twp.length) box.appendChild(el('div', 'muted', twp.join(' · ')));
 
+  // Coverage timeline: one tick per geometry check, so "checked and clear"
+  // moments are part of the record too.
+  if (home && home.timeline && home.timeline.length) {
+    box.appendChild(coverageStrip(home.timeline));
+  }
+
   // Dedicated history: every home episode the GIS watch has ever tracked.
   if (home && home.history && home.history.length) {
     const wrap = el('div', 'table-wrap');
@@ -565,11 +571,69 @@ function renderHome(home, current) {
       tr.appendChild(el('td', 'num', h.etrRevisions ? `×${h.etrRevisions}` : '0'));
       tr.appendChild(el('td', null, h.cause || '—'));
       tb.appendChild(tr);
+
+      // Specifics sub-row: geometry detail, the verbatim promise trail, and
+      // the first-promise grade.
+      const bits = [];
+      if (h.kind === 'polygon') bits.push('home inside the reported outage area');
+      else if (h.distM != null) bits.push(`outage ${fmtInt(h.distM)} m from home`);
+      if (h.etrHistory && h.etrHistory.length) {
+        bits.push(
+          'promise trail: ' + h.etrHistory.map((x) => fmtClock(x.etr)).join(' → ')
+        );
+      }
+      if (h.graded && h.firstErrorMin != null && h.etrRevisions > 0) {
+        bits.push(`graded on the first promise: ${fmtError(h.firstErrorMin)}`);
+      }
+      if (h.resolved && !h.graded && h.finalEtr != null && h.gapMin != null) {
+        bits.push(`observation gap ${fmtDurMin(h.gapMin)}`);
+      }
+      if (bits.length) {
+        const sub = document.createElement('tr');
+        const td = el('td', 'muted', bits.join(' · '));
+        td.colSpan = 7;
+        sub.appendChild(td);
+        tb.appendChild(sub);
+      }
     }
     t.appendChild(tb);
     wrap.appendChild(t);
     box.appendChild(wrap);
   }
+}
+
+// A tick strip of home geometry checks: amber = covered, green = clear.
+function coverageStrip(timeline) {
+  const wrap = el('div');
+  wrap.style.marginTop = '10px';
+  const W = 1000;
+  const H = 26;
+  const s = svg(W, H);
+  const n = timeline.length;
+  const bw = W / Math.max(48, n);
+  const accent = cssVar('--accent');
+  const ok = cssVar('--ontime');
+  timeline.forEach((r, i) => {
+    const x = W - (n - i) * bw;
+    const tick = rect(x, 4, Math.max(1.5, bw - 1.5), H - 8, r.covered ? accent : ok);
+    const title = document.createElementNS(SVGNS, 'title');
+    title.textContent =
+      `${fmtClock(r.ts)} — ${r.covered ? 'home covered' : 'clear'}` +
+      (r.covered && r.custA ? `, ${fmtInt(r.custA)} customers nearby` : '') +
+      (r.covered ? (r.etr ? `, promised ${fmtClock(r.etr)}` : ', no promise') : '') +
+      (!r.covered && r.nearestM != null ? `, nearest outage ${fmtInt(r.nearestM)} m` : '');
+    tick.appendChild(title);
+    s.appendChild(tick);
+  });
+  s.setAttribute('height', H);
+  wrap.appendChild(s);
+  const cap = el(
+    'div',
+    'muted',
+    `coverage timeline — one tick per geometry check, oldest ${fmtClock(timeline[0].ts)}`
+  );
+  wrap.appendChild(cap);
+  return wrap;
 }
 
 function renderCurrent(rows) {

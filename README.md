@@ -120,9 +120,11 @@ A fixed point is immune to the merge problem by construction: the question
 "is this location covered right now" needs no outage identity, so home
 episodes are defined purely by coverage continuity. The dashboard keeps a
 **dedicated home history**: every home episode ever tracked (ongoing or
-resolved, graded or not) with its full promise trail, plus a monitoring
-ledger (checks performed, checks that found the point covered). The published
-`home.json` carries status, history, and distances only — not the location.
+resolved, graded or not) with its full promise trail and geometry specifics,
+a per-poll **coverage timeline** (one tick per check — "checked and clear"
+is part of the record too), and a monitoring ledger (checks performed,
+checks that found the point covered). The published `home.json` carries
+status, history, and distances only — not the location.
 
 Two guardrails keep the scorecard itself honest:
 
@@ -299,7 +301,7 @@ The dashboard reads these static JSON documents (published locally under
 | `status.json` | Collection status + latest snapshot totals |
 | `current.json` | Currently-open outages |
 | `accuracy.json` | Aggregate accuracy on both bases (`final` / `first` stat blocks) + raw `errors` / `errorsFirst` arrays, plus an `outages` block with the same shape for clean geometric lifecycles (window, basis, scope, and histogram are applied in the browser) |
-| `home.json` | Home-watch status: covered/clear, nearest-outage distance, current home outage details, home track record (no coordinates) |
+| `home.json` | Home-watch status: covered/clear, nearest-outage distance, current home outage details, the full episode history with promise trails, and a per-poll coverage timeline (~3.5 days) — no coordinates |
 | `timeseries.json` | Customers-out over the collection window |
 
 The local dev server additionally exposes `POST /api/collect` to trigger a poll

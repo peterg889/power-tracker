@@ -176,6 +176,13 @@ test('home episodes: coverage continuity survives merge-like churn', () => {
   // Monitoring ledger: 3 checks, covered during 2 of them.
   assert.deepEqual(h.monitoring, { since: T0, checks: 3, coveredChecks: 2 });
 
+  // Per-poll audit trail: every check on record, including the clear one.
+  assert.equal(h.timeline.length, 3);
+  assert.deepEqual(h.timeline.map((r) => r.covered), [true, true, false]);
+  assert.equal(h.timeline[0].custA, 40);
+  assert.equal(h.timeline[0].etr, T0 + 120 * MIN);
+  assert.equal(h.timeline[2].nearestM, 5000);
+
   // ETR falls back to the township estimate when the outage has none.
   const s2 = createState();
   applyHomeImpact(

@@ -477,10 +477,16 @@ export function outageAccuracy(state, { onTimeWindowMin = 60, maxGapMin = Infini
 // `impact` comes from kubra.fetchHomeImpact; `areaEtr` is the home township's
 // report-level ETR, used as the promised time when the covering outage itself
 // carries none (blanket area estimates are published at that level).
+// Every geometry check of the home point is recorded (compact ring buffer),
+// so the home history covers "checked and clear" moments too — a complete
+// per-poll audit trail, not just the episodes. ~31 days at 15-min polls.
+const HOME_CHECK_CAP = 3000;
+
 export function applyHomeImpact(state, impact, ts, areaEtr = null) {
   if (!impact || !impact.checked) return null;
   state.homeSeq ??= 0;
   state.homeEpisodes ??= [];
+  state.homeChecks ??= [];
   state.homeStats ??= { firstCheckTs: ts, checks: 0, covered: 0 };
   state.homeStats.checks++;
   if (impact.covered) state.homeStats.covered++;
@@ -491,10 +497,17 @@ export function applyHomeImpact(state, impact, ts, areaEtr = null) {
     radiusM: impact.radiusM ?? null,
     matches: impact.matches?.length ?? 0,
   };
+  const pushCheck = (row) => {
+    state.homeChecks.push(row);
+    if (state.homeChecks.length > HOME_CHECK_CAP) {
+      state.homeChecks.splice(0, state.homeChecks.length - HOME_CHECK_CAP);
+    }
+  };
 
   const open = state.homeEpisodes.find((e) => !e.resolved);
 
   if (!impact.covered) {
+    pushCheck({ ts, c: 0, nm: impact.nearestM ?? null });
     if (open) {
       open.resolved = true;
       open.resolvedTs = ts;
@@ -506,6 +519,7 @@ export function applyHomeImpact(state, impact, ts, areaEtr = null) {
     impact.matches.find((m) => m.kind === 'polygon') || impact.matches[0] || {};
   const etr = best.etr ?? areaEtr ?? null;
   const custA = impact.matches.reduce((s, m) => s + (m.custA || 0), 0);
+  pushCheck({ ts, c: 1, nm: impact.nearestM ?? null, cust: custA, etr });
 
   let ep = open;
   if (!ep) {
@@ -590,6 +604,15 @@ export function homeStatus(state, { maxGapMin = Infinity } = {}) {
           coveredChecks: state.homeStats.covered,
         }
       : null,
+    // Per-poll audit trail for the home point (most recent ~3.5 days),
+    // including polls where the point was checked and found clear.
+    timeline: (state.homeChecks || []).slice(-336).map((r) => ({
+      ts: r.ts,
+      covered: Boolean(r.c),
+      nearestM: r.nm ?? null,
+      custA: r.cust ?? null,
+      etr: r.etr ?? null,
+    })),
     current: open
       ? {
           startTs: open.startTs,
